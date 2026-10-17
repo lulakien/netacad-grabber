@@ -1,0 +1,19 @@
+# Downloaded course exports and test fixtures must never be committed.
+*.zip
+tested-courses/
+test-output/
+artifacts/
+*.log
+
+# Local profiles / secrets
+.env
+.env.*
+cookies*
+*.sqlite
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+node_modules/

@@ -1,17 +1,36 @@
 # NetAcad Course Grabber
 
-A Manifest-V3 Chrome extension that turns a logged-in Cisco NetAcad course into
-one **ZIP in your Downloads folder**: every lesson as Markdown (plus a light-DOM
-HTML snapshot), images, **Packet Tracer `.pka` lab files**, Resources-tab lab
-documents, course resource documents (PDFs extracted to text), and the course's
-own raw authoring JSON. Brightcove-hosted videos are recorded as their
-`video-id` and poster, not as protected stream binaries. Nothing is hardcoded to
-a particular course — it reads the course that is open in front of you. Works on
-the "Skills for All" platform (www.netacad.com).
+**Current build:** `1.0.9` · Manifest V3 · Chrome/Edge 111+ · desktop only.
+
+**At a glance**
+
+- One ZIP per course: ordered Markdown, lesson media, Packet Tracer labs, PDFs
+  as text, Resources-tab files, and the course's raw authoring JSON.
+- Reads the logged-in course that is open in front of you; no hardcoded course.
+- **Use only on content you are entitled to access.** This is a personal-study
+  export tool, not a paywall bypass. Nothing is uploaded.
+- Verified against 14 free Skills-for-All courses; the remaining free catalog
+  courses and paid/instructor-led courses depend on the same player and still
+  need manual verification. See [Status](#status-and-coverage).
+
+It writes one ZIP into your Downloads folder. Lesson pages become Markdown;
+images, Packet Tracer labs and Resources-tab files stay as files; PDFs get text
+extracted; the course's own authoring JSON is included for re-hosting or
+diffing. Brightcove video streams are recorded as their `video-id` and poster,
+not as protected binaries. Built for the Skills-for-All player at
+`www.netacad.com`.
 
 ---
 
 ## How to use
+
+### Get it
+
+- **Easiest:** download `netacad-grabber.zip` from
+  [GitHub Releases](https://github.com/lulakien/netacad-grabber/releases),
+  unzip it, and load the folder as an unpacked extension.
+- **For contributing:** `git clone
+  https://github.com/lulakien/netacad-grabber.git`.
 
 ### Install (load unpacked)
 
@@ -300,6 +319,25 @@ For a module-only PDF, concatenate the `markdown` paths of one
 page's `content.md` directly. `content.html` is only a light-DOM snapshot and
 is not the print source.
 
+## Status and coverage
+
+Verified end-to-end against **14 free Skills-for-All courses** (Getting Started
+with Packet Tracer, Ethical Hacker, Endpoint Security, Networking Basics,
+Introduction to Modern AI, Data Science Essentials with Python, Data Analytics
+Essentials, Introduction to Data Science, Find Insights with AI, Python
+Essentials 1/2, JavaScript Essentials 1/2, C++ Essentials 1). For each ZIP,
+page and asset counts were compared with the course's own `contentObjects.json`
+and `assets.json`; all lesson text was checked for renderer noise.
+
+Not yet covered:
+
+- the remaining free catalog courses;
+- paid/instructor-led courses — likely the same player, but unverified;
+- DRM/SCORM/external-LMS content, which may not expose readable pages.
+
+Server-side `403` resources are reported, not bypassed. There is no committed
+automated test suite yet; the Playwright harnesses live outside this repo.
+
 ## Notes & limitations
 
 - **`content.md` is the rendered full-text artifact.** `content.html` captures
@@ -336,6 +374,39 @@ is not the print source.
   its code cache; the version stamp `data-ngb-cs` on `<html>` shows which
   build is actually running if a refresh ever looks stale.)
 
+## Troubleshooting
+
+- **No panel:** confirm Developer mode is on, reload the extension card, then
+  hard-refresh the NetAcad page. Check `<html data-ngb-cs="1.0.9">` in DevTools.
+- **“No course outline found”:** open the course's **Content / Curriculum**
+  view and wait for the outline to render before clicking the button.
+- **`DONE (partial)`:** open `FAILURES.txt`; usually a server-side `403` or an
+  external link, not a missing local file.
+- **ZIP not in Downloads:** the page-anchor path may be blocked by browser
+  policy; check the panel log and the Downloads folder. ZIPs over ~36 MB only
+  use the anchor path because of Chrome's message limit.
+- **PDF text missing:** the PDF may be scanned or server-gated. Scanned files
+  are kept raw next to the `.md`; gated files become stubs.
+- **Chrome/Edge older than 111:** `world: "MAIN"` scripts are unsupported.
+- **Course walk skips items:** assessments/quizzes/tests/surveys and hidden
+  Packet Tracer launcher shells are intentionally skipped.
+
+## Contributing
+
+Issues and PRs are welcome. This project deliberately has **no build step**:
+edit the plain content scripts/service worker, reload unpacked, and test on a
+free course.
+
+Please:
+
+- keep it client-side and local — no uploads, analytics, or external servers;
+- do not add authentication/licensing bypasses;
+- update `CS_VERSION` and `manifest.json` when changing injected code;
+- include a course name, panel log, and `FAILURES.txt` excerpt for bug reports;
+- keep third-party licenses intact (`fflate`, `pdf.js`).
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the short checklist.
+
 ## Files
 
 | File | Purpose |
@@ -346,6 +417,12 @@ is not the print source.
 | `content.js` | All the page work: shadow-aware extraction, settle detection, course walk, Resources/PDF capture, ZIP packaging. |
 | `zip/fflate.min.js` | [fflate](https://github.com/feross/fflate) — in-page ZIP compression. |
 | `pdf/pdf.min.js`, `pdf/pdf.worker.min.js` | [pdf.js 3.11.174](https://github.com/mozilla/pdf.js) (last UMD release) — text extraction of PDFs, run as an in-thread fake worker in the service worker. |
+
+## License
+
+The original extension code is MIT-licensed; see [`LICENSE`](LICENSE).
+`fflate` and `pdf.js` keep their own licenses. Cisco, NetAcad and Packet Tracer
+are trademarks of Cisco Inc.; this project is not affiliated with Cisco.
 
 ## Credits & licenses
 
