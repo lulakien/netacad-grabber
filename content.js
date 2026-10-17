@@ -16,18 +16,31 @@
   const IS_TOP = window === window.top;
   const NG = (m) => console.info("[netacad-grabber]", m);
   // bump on every content-script change; shown as <html data-ngb-cs> for diagnostics
-  const CS_VERSION = "1.0.8-r3";
+  const CS_VERSION = "1.0.9";
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ------------------------------------------------------------- utils
   function sanitizeName(s, maxLen) {
     maxLen = maxLen || 60;
     const out = String(s || "")
-      .replace(/[\\/:*?"<>|]+/g, "-")
+      .replace(/[\u2010-\u2015\u2212]/g, "-") // typographic dashes
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/[\u201c\u201d]/g, '"')
+      .replace(/\u2026/g, "...")
+      .replace(/\u00a0/g, " ")
+      .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "-")
       .replace(/\s+/g, " ")
       .replace(/-+/g, "-")
-      .trim();
-    return (out || "untitled").slice(0, maxLen);
+      .trim()
+      .slice(0, maxLen)
+      .replace(/[ .-]+$/g, "");
+    return out || "untitled";
+  }
+
+  function escapeHtml(s) {
+    return String(s || "").replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
   }
 
   function hashStr(s) {
@@ -51,20 +64,69 @@
     }
   }
 
-  function visible(el) {
+  function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  // NetAcad repeats page/block status in aria-only labels ("Incomplete").
+  // Skip those subtrees so lesson text is not polluted with screen-reader chrome.
+  const SKIP_CLASS_RE = /(^|[\s_-])(accessibility[\w-]*|sr-only|visually-hidden|screen-reader[\w-]*|js-heading|js-heading-inner|aria-label)([\s_-]|$)/i;
+  function shouldSkipElement(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.id === "__ngbPanelHost") return true;
+    if (el.hasAttribute("hidden")) return true;
+    if (el.getAttribute("aria-hidden") === "true") return true;
+    const cls = typeof el.className === "string" ? el.className : (el.getAttribute("class") || "");
+    if (SKIP_CLASS_RE.test(cls)) return true;
+    // video.js chrome (transcript controls, dropdowns, spinners) is not lesson
+    // text; keep the poster image and any real <video> source.
+    if (!/^(VIDEO|AUDIO|IMG|SOURCE)$/.test(el.tagName)) {
+      if (/(^|[\s_-])vjs-/.test(cls) && !/(^|[\s_-])vjs-poster([\s_-]|$)/.test(cls)) return true;
+      if (/(^|[\s_-])media-loader([\s_-]|$)/.test(cls)) return true;
+    }
+    // The page header is rendered again as the Markdown H1; keeping it in the
+    // body duplicates the lesson title and its progress chrome.
+    if (/(^|[\s_-])(page__header|page__header-wrapper)([\s_-]|$)/i.test(cls)) return true;
+    const st = el.getAttribute("style") || "";
+    return /display\s*:\s*none|visibility\s*:\s*hidden/i.test(st);
+  }
+
+  function cleanInnerHtml(root) {
+    if (!root) return "";
     try {
-      const cs = el.ownerDocument.defaultView.getComputedStyle(el);
-      if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 0 || r.height > 0;
+      const clone = root.cloneNode(true);
+      const panel = clone.querySelector && clone.querySelector("#__ngbPanelHost");
+      if (panel) panel.remove();
+      return clone.innerHTML;
     } catch (e) {
-      return true;
+      return root.innerHTML || "";
     }
   }
 
+  function queryAllDeep(root, selector) {
+    const out = [];
+    if (!root) return out;
+    for (const el of walkAll(root)) {
+      try { if (el.matches && el.matches(selector)) out.push(el); } catch (e) {}
+    }
+    return out;
+  }
+
   function elementText(el) {
-    // innerText is layout-aware; fall back to textContent
-    try { return el.innerText || el.textContent || ""; } catch (e) { return el.textContent || ""; }
+    // innerText is layout-aware. textContent is only a fallback after removing
+    // script/style payloads: a shadow-only body otherwise scores on its own
+    // inline <script> source and outranks the real content container.
+    try { const t = el.innerText; if (t && t.trim()) return t; } catch (e) {}
+    let out = "";
+    const stack = [el];
+    while (stack.length && out.length < 20000) {
+      const n = stack.pop();
+      if (n.nodeType === 3) { out += n.nodeValue; continue; }
+      if (n.nodeType !== 1) continue;
+      if (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD)$/.test(n.tagName)) continue;
+      for (let i = n.childNodes.length - 1; i >= 0; i--) stack.push(n.childNodes[i]);
+    }
+    return out;
   }
   // text of an element's subtree INCLUDING nested shadow roots (textContent cannot cross them)
   function shadowText(el) {
@@ -106,9 +168,7 @@
   }
 
   // ----------------------------------------------------- 1. copy unlock
-  const BLOCKED_EVENTS = new Set(["contextmenu", "selectstart", "dragstart", "copy", "auxclick", "select"]);
-
-  function installUnlock() {
+  function installUnlock(withOverlay) {
     const doc = document;
     const win = doc.defaultView;
 
@@ -122,44 +182,49 @@
       (doc.head || doc.documentElement).appendChild(style);
     }
 
-    // (b) swallow the site's own copy-blocking listeners
-    if (!win.__ngbListenPatched) {
-      win.__ngbListenPatched = true;
-      const proto = win.EventTarget.prototype;
-      const origAdd = proto.addEventListener;
-      proto.addEventListener = function (type, fn, opts) {
-        if (BLOCKED_EVENTS.has(type) && (typeof fn === "function" || typeof fn === "object")) {
-          const wrapper = function (e) {
-            // let the browser default happen (copy works); suppress the site handler entirely
-            if (e) e.stopPropagation();
-          };
-          // keep a registry so we can restore if needed
-          (win.__ngbSwallowed = win.__ngbSwallowed || []).push({ type, fn, opts });
-          return origAdd.call(this, type, wrapper, opts);
-        }
-        return origAdd.call(this, type, fn, opts);
-      };
-    }
+    // (b) the site's copy listeners are neutralised by mainworld.js, which
+    // runs in the page's own world. Patching EventTarget here would only
+    // affect this isolated world and would not touch the site's handlers.
 
-    // (c) clear inline on<event> attributes the site may set
+    // (c) clear inline on<event> attributes the site may set. Content-script
+    // IDL properties do not expose the page's inline handlers reliably, so
+    // remove the attributes themselves.
     try {
+      const attrs = ["oncontextmenu", "onselectstart", "ondragstart", "oncopy", "oncut", "onpaste"];
+      const guarded = [];
       for (const el of walkAll(doc.documentElement)) {
-        for (const ev of ["oncontextmenu", "onselectionstart", "ondragstart", "oncopy"]) {
-          if (el[ev] !== null) el[ev] = null;
-        }
+        if (attrs.some((a) => el.hasAttribute(a))) guarded.push(el);
+      }
+      if (guarded.length) {
+        // Remove in the page world first: removing the attribute only from
+        // the isolated world can leave Chromium's compiled inline handler
+        // attached. Fall back to isolated removal if mainworld is absent.
+        window.postMessage({ __ngbMain: "clearInline" }, "*");
+        setTimeout(() => {
+          for (const el of guarded) {
+            for (const attr of attrs) {
+              if (el.hasAttribute(attr)) el.removeAttribute(attr);
+            }
+          }
+        }, 250);
       }
     } catch (e) { /* best effort */ }
 
-    // (d) capture pointer-event overlay divs: zero them out
+    // (d) capture pointer-event overlay divs: zero them out. This is a forced
+    // layout pass, so only run it on the initial install, not every 3 s.
+    if (withOverlay === false) return;
     try {
       for (const el of walkAll(doc.body)) {
+        if (el.id === "__ngbPanelHost") continue;
         const cs = win.getComputedStyle(el);
         if (cs.position === "absolute" || cs.position === "fixed") {
           const r = el.getBoundingClientRect();
           const big = r.width > 200 && r.height > 200;
           const empty = !el.textContent.trim() && el.children.length === 0 && !el.querySelector("img,canvas,video");
-          if (big && empty && cs.pointerEvents === "auto" && r.zIndex !== "0" && (el.className || "").toString() !== "") {
-            // suspicious full-cover overlay; disable it
+          const cls = typeof el.className === "string" ? el.className : (el.getAttribute("class") || "");
+          const z = cs.zIndex;
+          if (big && empty && cs.pointerEvents === "auto" && z !== "auto" && z !== "0" && (z !== "" || cls)) {
+            // suspicious full-cover click shield; disable it
             el.style.pointerEvents = "none";
           }
         }
@@ -167,45 +232,89 @@
     } catch (e) { /* best effort */ }
   }
 
-  // capture object URLs (blob downloads) so we can grab their bytes later
-  const objectUrlToBlob = new Map(); // "blob:..." -> Blob
-  function installBlobHook() {
-    const win = window;
-    if (win.__ngbBlobPatched) return;
-    win.__ngbBlobPatched = true;
-    const origCreate = win.URL.createObjectURL;
-    win.URL.createObjectURL = function (blob) {
-      const url = origCreate.call(win.URL, blob);
-      try { objectUrlToBlob.set(url, blob); } catch (e) {}
-      return url;
-    };
-    const origRevoke = win.URL.revokeObjectURL;
-    win.URL.revokeObjectURL = function (url) {
-      objectUrlToBlob.delete(url);
-      return origRevoke.call(win.URL, url);
-    };
+  // Object URLs are created in the page's main world (mainworld.js tracks
+  // them). Ask it for the bytes when chrome.downloads reports a blob download.
+  const pageBlobWaiters = new Map(); // seq -> { resolve, timer }
+  let pageBlobSeq = 0;
+  let pageBridgeInstalled = false;
+
+  function installPageBridge() {
+    if (pageBridgeInstalled) return;
+    pageBridgeInstalled = true;
+    window.addEventListener("message", (e) => {
+      if (e.source !== window) return;
+      const d = e.data;
+      if (!d) return;
+      if (d.__ngbMain === "resourceDownload" && typeof d.url === "string") {
+        pushResourceDownload(d);
+        return;
+      }
+      if (d.__ngbMain !== "blobData" || typeof d.seq !== "number") return;
+      const w = pageBlobWaiters.get(d.seq);
+      if (!w) return;
+      pageBlobWaiters.delete(d.seq);
+      clearTimeout(w.timer);
+      w.resolve(d);
+    });
   }
 
-  async function blobToB64(blob) {
-    const buf = await blob.arrayBuffer();
-    const u8 = new Uint8Array(buf);
-    let s = "";
-    const CHUNK = 0x8000;
-    for (let i = 0; i < u8.length; i += CHUNK) {
-      s += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+  function getPageBlob(url, timeoutMs) {
+    return new Promise((resolve) => {
+      const seq = ++pageBlobSeq;
+      const timer = setTimeout(() => {
+        pageBlobWaiters.delete(seq);
+        resolve({ ok: false, error: "timeout" });
+      }, timeoutMs || 15000);
+      pageBlobWaiters.set(seq, { resolve, timer });
+      try {
+        window.postMessage({ __ngbMain: "getBlob", url, seq }, "*");
+      } catch (e) {
+        clearTimeout(timer);
+        pageBlobWaiters.delete(seq);
+        resolve({ ok: false, error: String((e && e.message) || e) });
+      }
+    });
+  }
+
+  // Signed Resources-tab downloads: mainworld.js intercepts the hidden
+  // <a download> before it starts and posts the URL here.
+  const resourceDownloadQueue = [];
+  const resourceDownloadWaiters = [];
+  const resourceDownloadSeen = new Set();
+  function pushResourceDownload(d) {
+    if (!d || !d.url || resourceDownloadSeen.has(d.url)) return;
+    resourceDownloadSeen.add(d.url);
+    const w = resourceDownloadWaiters.shift();
+    if (w) {
+      clearTimeout(w.timer);
+      w.resolve(d);
+    } else {
+      resourceDownloadQueue.push(d);
     }
-    return btoa(s);
+  }
+  function nextResourceDownload(timeoutMs) {
+    if (resourceDownloadQueue.length) return Promise.resolve(resourceDownloadQueue.shift());
+    return new Promise((resolve) => {
+      const w = { resolve, timer: null };
+      w.timer = setTimeout(() => {
+        const i = resourceDownloadWaiters.indexOf(w);
+        if (i >= 0) resourceDownloadWaiters.splice(i, 1);
+        resolve(null);
+      }, timeoutMs || 15000);
+      resourceDownloadWaiters.push(w);
+    });
   }
 
   // ------------------------------------------------- 2. content root
   const PENALTY_RE = /nav|sidebar|outline|drawer|menu|header|footer|popup|banner|cookie|tooltip|progress|survey|chat|webex/i;
 
   function findContentRoot(doc) {
-    const win = doc.defaultView;
+    const view = doc.defaultView;
     const candidates = [];
     const consider = (el) => {
       if (!el || el.nodeType !== 1) return;
       if (/^(SCRIPT|STYLE|NOSCRIPT|LINK|META|TITLE|HEAD)$/.test(el.tagName)) return;
+      if (shouldSkipElement(el)) return;
       const clsId = ((el.className && typeof el.className === "string" ? el.className : "") + " " + (el.id || "")).toLowerCase();
       const boosted = el.id === "Wrapper" || el.tagName === "MAIN" || el.getAttribute("role") === "main" ||
         el.tagName === "PAGE-VIEW" || el.tagName === "BASE-VIEW";
@@ -217,7 +326,9 @@
       candidates.push({ el, score });
     };
     for (const el of walkAll(doc.documentElement)) {
-      if (!el.offsetParent && el.tagName !== "BODY" && getComputedStyle(el).position !== "fixed") continue;
+      let pos = "static";
+      try { pos = view ? view.getComputedStyle(el).position : "static"; } catch (e) {}
+      if (!el.offsetParent && el.tagName !== "BODY" && pos !== "fixed") continue;
       consider(el);
       if (candidates.length > 400) break;
     }
@@ -233,46 +344,150 @@
     return s.replace(/([\\_*`[\]])/g, "\\$1");
   }
 
+  const BLOCK_TAGS = /^(P|H[1-6]|UL|OL|LI|DL|DT|DD|TABLE|THEAD|TBODY|TFOOT|TR|BLOCKQUOTE|PRE|HR|DIV|SECTION|ARTICLE|FIGURE|FIGCAPTION|HEADER|FOOTER|MAIN|ASIDE|NAV|DETAILS|SUMMARY|FORM|FIELDSET|ADDRESS)$/;
+
+  function mediaSrcOf(node) {
+    const sources = [];
+    if (node.currentSrc) sources.push(node.currentSrc);
+    if (node.src) sources.push(node.src);
+    for (const s of node.querySelectorAll ? node.querySelectorAll("source") : []) {
+      if (s.src) sources.push(s.src);
+    }
+    return sources;
+  }
+
+  function imgMd(node, ctx) {
+    const src = node.currentSrc || node.src;
+    if (!src) return "";
+    ctx.imgs.push(src);
+    const rel = ctx.mediaIndex.get(src);
+    const alt = escMd(String(node.alt || "image")).replace(/[()]/g, "\\$&");
+    return "![" + alt + "](" + (rel || src) + ")";
+  }
+
+  // Markdown for one element in an inline context. inlineMd() itself only
+  // walks children, so top-level inline elements (e.g. a bare <a> or <code>)
+  // still render correctly when blockMd() encounters them.
+  function inlineElementMd(node, ctx) {
+    if (shouldSkipElement(node)) return "";
+    const tag = node.tagName;
+    if (tag === "BR") return "\n";
+    if (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|SVG)$/.test(tag)) return "";
+    if (tag === "IFRAME") {
+      const src = node.src || "";
+      if (src && !ctx.iframeSkipped.has(src)) {
+        ctx.iframeLinks.push(src);
+        ctx.iframeSkipped.add(src);
+        return "[embed: " + src + "]";
+      }
+      return "";
+    }
+    if (tag === "OBJECT" || tag === "EMBED") {
+      const src = node.data || node.src || "";
+      if (src) ctx.iframeLinks.push(src);
+      return src ? "[embed: " + src + "]" : "";
+    }
+    if (tag === "IMG") return imgMd(node, ctx);
+    if (tag === "A") {
+      const t = inlineMd(node, ctx).trim();
+      const href = node.href || "";
+      if (href) ctx.links.push(href);
+      return href ? "[" + t + "](" + href + ")" : t;
+    }
+    if (/^(STRONG|B)$/.test(tag)) { const t = inlineMd(node, ctx).trim(); return t ? "**" + t + "**" : ""; }
+    if (/^(EM|I)$/.test(tag)) { const t = inlineMd(node, ctx).trim(); return t ? "*" + t + "*" : ""; }
+    if (/^(DEL|S|STRIKE)$/.test(tag)) { const t = inlineMd(node, ctx).trim(); return t ? "~~" + t + "~~" : ""; }
+    if (tag === "CODE") { const t = node.textContent; return t ? "`" + t.replace(/`/g, "\\`") + "`" : ""; }
+    if (tag === "VIDEO" || tag === "AUDIO") {
+      const src = (mediaSrcOf(node)[0] || "");
+      if (src) ctx.media.push({ url: src, kind: tag === "VIDEO" ? "video" : "audio" });
+      return src ? "[" + tag.toLowerCase() + ": " + src + "]" : "";
+    }
+    return inlineMd(node, ctx);
+  }
+
+  function isChromeText(text) {
+    return /^(scroll to begin|show transcript|follow along using the transcript\.?)$/i.test(String(text || "").trim());
+  }
+
   function inlineMd(node, ctx) {
     let out = "";
     for (const child of node.childNodes) {
       if (child.nodeType === 3) {
-        out += child.nodeValue.replace(/\s+/g, " ");
+        if (!isChromeText(child.nodeValue)) out += escMd(child.nodeValue.replace(/\s+/g, " "));
       } else if (child.nodeType === 1) {
-        const tag = child.tagName;
-        if (tag === "BR") { out += "\n"; continue; }
-        if (/^(SCRIPT|STYLE|NOSCRIPT|SVG|IFRAME|OBJECT|EMBED)$/.test(tag)) {
-          if (tag === "IFRAME") {
-            const src = child.src || "";
-            if (src && !ctx.iframeSkipped.has(src)) { ctx.iframeLinks.push(src); ctx.iframeSkipped.add(src); out += " [embed: " + src + "] "; }
-          }
-          continue;
-        }
-        if (tag === "IMG") {
-          const src = child.currentSrc || child.src;
-          if (src) {
-            ctx.imgs.push(src);
-            const rel = ctx.mediaIndex.get(src);
-            out += " ![" + (child.alt || "") + "](" + (rel || src) + ") ";
-          }
-          continue;
-        }
-        if (tag === "A") {
-          const t = inlineMd(child, ctx).trim();
-          const href = child.href || "";
-          out += href ? " [" + t + "](" + href + ") " : " " + t + " ";
-          ctx.links.push(href);
-          continue;
-        }
-        if (/^(STRONG|B)$/.test(tag)) { const t = inlineMd(child, ctx).trim(); if (t) out += "**" + t + "**"; continue; }
-        if (/^(EM|I)$/.test(tag)) { const t = inlineMd(child, ctx).trim(); if (t) out += "*" + t + "*"; continue; }
-        if (/^(DEL|S|STRIKE)$/.test(tag)) { const t = inlineMd(child, ctx).trim(); if (t) out += "~~" + t + "~~"; continue; }
-        if (tag === "CODE") { const t = child.textContent; if (t) out += "`" + t + "`"; continue; }
-        if (tag === "SUB") { const t = inlineMd(child, ctx).trim(); out += " " + t + " "; continue; }
-        out += inlineMd(child, ctx);
+        out += inlineElementMd(child, ctx);
       }
     }
     return out;
+  }
+
+  function listMd(listEl, ctx, depth) {
+    const lines = [];
+    const start = parseInt(listEl.getAttribute("start") || "1", 10);
+    let n = Number.isFinite(start) ? start - 1 : 0;
+    const ordered = listEl.tagName === "OL";
+    for (const li of listEl.children) {
+      if (li.tagName !== "LI") continue;
+      n++;
+      const parts = [];
+      const subs = [];
+      for (const child of li.childNodes) {
+        if (child.nodeType === 3) parts.push(escMd(child.nodeValue.replace(/\s+/g, " ")));
+        else if (child.nodeType === 1) {
+          if (child.tagName === "UL" || child.tagName === "OL") subs.push(child);
+          else parts.push(inlineElementMd(child, ctx));
+        }
+      }
+      const text = parts.join("").replace(/[ \t]+/g, " ").trim();
+      lines.push("  ".repeat(depth) + (ordered ? n + ". " : "- ") + text);
+      for (const sub of subs) lines.push(...listMd(sub, ctx, depth + 1));
+    }
+    return lines;
+  }
+
+  function blockChildrenMd(node, ctx, depth) {
+    const lines = [];
+    let inlineBuf = "";
+    const flush = () => {
+      const t = inlineBuf.replace(/[ \t]+/g, " ").trim();
+      if (t) lines.push(t, "");
+      inlineBuf = "";
+    };
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) {
+        if (!isChromeText(child.nodeValue)) inlineBuf += escMd(child.nodeValue.replace(/\s+/g, " "));
+        continue;
+      }
+      if (child.nodeType !== 1) continue;
+      if (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|LINK|META)$/.test(child.tagName)) continue;
+      if (BLOCK_TAGS.test(child.tagName) || child.shadowRoot) {
+        flush();
+        lines.push(...blockMd(child, ctx, depth + 1));
+      } else {
+        inlineBuf += inlineElementMd(child, ctx);
+      }
+    }
+    flush();
+    if (node.shadowRoot) {
+      for (const child of node.shadowRoot.children) lines.push(...blockMd(child, ctx, depth + 1));
+    }
+    return lines;
+  }
+
+  function tableMd(node, ctx) {
+    const lines = [];
+    const rows = [...node.querySelectorAll("tr")];
+    if (!rows.length) return lines;
+    const mdRows = rows.map((tr) => {
+      const cells = [...tr.children].filter((c) => c.tagName === "TD" || c.tagName === "TH");
+      return "|" + cells.map((cell) =>
+        " " + inlineMd(cell, ctx).replace(/\|/g, "\\|").replace(/\s+/g, " ").trim() + " "
+      ).join("|") + "|";
+    });
+    const cols = Math.max(1, [...rows[0].children].filter((c) => c.tagName === "TD" || c.tagName === "TH").length);
+    lines.push(mdRows[0], "|" + " --- |".repeat(cols), ...mdRows.slice(1), "");
+    return lines;
   }
 
   function blockMd(node, ctx, depth) {
@@ -281,7 +496,9 @@
     const tag = node.tagName;
     // non-content nodes: skip (e.g. the <style id="customCSS"> blobs in shadow roots)
     if (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|LINK|META)$/.test(tag)) return lines;
-    const isBlock = /^(P|H1|H2|H3|H4|H5|H6|UL|OL|TABLE|BLOCKQUOTE|PRE|HR|DIV|SECTION|ARTICLE|FIGURE|LI)$/.test(tag) || node.shadowRoot;
+    if (shouldSkipElement(node)) return lines;
+    const videoIds = node.getAttribute && node.getAttribute("data-videoids");
+    if (videoIds) lines.push("[video-id: " + videoIds + "]", "");
 
     if (/^H[1-6]$/.test(tag)) {
       const t = inlineMd(node, ctx).replace(/\s+/g, " ").trim();
@@ -291,50 +508,22 @@
     if (tag === "HR") { lines.push("---", ""); return lines; }
     if (tag === "PRE") {
       const t = node.textContent.replace(/\s+$/g, "");
-      lines.push("```", t, "```", "");
+      const longest = (t.match(/`+/g) || []).reduce((m, s) => Math.max(m, s.length), 2);
+      const fence = "`".repeat(Math.max(3, longest + 1));
+      lines.push(fence, t, fence, "");
       return lines;
     }
     if (tag === "BLOCKQUOTE") {
-      const inner = [];
-      for (const c of node.children) inner.push(...blockMd(c, ctx, depth));
-      const txt = inner.join("\n");
+      const txt = blockChildrenMd(node, ctx, depth).join("\n");
       lines.push(txt.split("\n").map((l) => (l ? "> " + l : ">")).join("\n"), "");
       return lines;
     }
     if (tag === "UL" || tag === "OL") {
-      let n = 0;
-      for (const c of node.children) {
-        if (c.tagName === "LI") {
-          n++;
-          const bullet = tag === "OL" ? n + ". " : "- ";
-          const kids = [...c.children].filter((k) => k.tagName !== "UL" && k.tagName !== "OL");
-          const sub = [...c.children].filter((k) => k.tagName === "UL" || k.tagName === "OL");
-          const main = inlineMd(c, { ...ctx, liMain: kids }).trim();
-          const t = kids.length ? inlineMd(kids[0], ctx).trim() : "";
-          let line = bullet + (t || main).slice(0, 500);
-          // fallback: strip nested-list text already included
-          lines.push(line);
-          for (const s of sub) {
-            for (const sc of s.children) {
-              if (sc.tagName === "LI") {
-                const st = inlineMd(sc, ctx).trim();
-                lines.push((s.tagName === "OL" ? "  " + (n + 1) + ". " : "  - ") + st);
-              }
-            }
-          }
-        }
-      }
-      lines.push("");
+      lines.push(...listMd(node, ctx, 0), "");
       return lines;
     }
     if (tag === "TABLE") {
-      const rows = [...node.querySelectorAll("tr")];
-      const mdRows = rows.map((tr) =>
-        ["|", ...[...tr.children].map((td) => " " + (td.textContent || "").trim().replace(/\|/g, "\\|").replace(/\s+/g, " ") + " "), "|"].join("")
-      );
-      if (mdRows.length) {
-        lines.push(mdRows[0], "| " + "---- |".repeat(Math.max(1, rows[0].children.length)), ...mdRows.slice(1), "");
-      }
+      lines.push(...tableMd(node, ctx));
       return lines;
     }
     if (tag === "P") {
@@ -343,98 +532,112 @@
       return lines;
     }
     if (tag === "IMG") {
-      const src = node.currentSrc || node.src;
-      if (src) {
-        ctx.imgs.push(src);
-        const rel = ctx.mediaIndex.get(src);
-        lines.push("![image](" + (rel || src) + ")", "");
-      }
+      const md = imgMd(node, ctx).trim();
+      if (md) lines.push(md, "");
       return lines;
     }
     if (tag === "VIDEO" || tag === "AUDIO") {
-      const src = node.src || node.currentSrc || (node.querySelector("source") || {}).src || "";
-      if (src) {
-        ctx.media.push({ url: src, kind: tag === "VIDEO" ? "video" : "audio" });
-        lines.push("[" + tag.toLowerCase() + ": " + src + "]", "");
-      }
+      const md = inlineElementMd(node, ctx).trim();
+      if (md) lines.push(md, "");
       return lines;
     }
-    // DIV/SECTION/etc: recurse
-    if (isBlock) {
-      for (const c of node.children) {
-        if (c.nodeType === 1) lines.push(...blockMd(c, ctx, depth + 1));
-      }
-      // direct text (not inside a block child)
-      const directText = [...node.childNodes].filter((n) => n.nodeType === 3).map((n) => n.nodeValue).join(" ");
-      const t = directText.replace(/\s+/g, " ").trim();
-      if (t) lines.push(t, "");
-      if (node.shadowRoot) {
-        for (const c of node.shadowRoot.children) lines.push(...blockMd(c, ctx, depth + 1));
-      }
-      // collapse extra blank lines
+    if (BLOCK_TAGS.test(tag) || node.shadowRoot) {
+      lines.push(...blockChildrenMd(node, ctx, depth));
       return lines;
     }
-    const t = inlineMd(node, ctx).replace(/\s+/g, " ").trim();
+    const t = inlineElementMd(node, ctx).replace(/\s+/g, " ").trim();
     if (t) lines.push(t, "");
     return lines;
   }
 
   function docToMarkdown(root) {
     const ctx = { imgs: [], media: [], links: [], iframeLinks: [], iframeSkipped: new Set(), mediaIndex: new Map() };
-    const lines = [];
-    // direct children of root
-    for (const c of root.children) lines.push(...blockMd(c, ctx));
-    if (root.shadowRoot) for (const c of root.shadowRoot.children) lines.push(...blockMd(c, ctx));
+    const lines = blockChildrenMd(root, ctx, 0);
     let md = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
     return { md, ctx };
   }
 
   // ------------------------------------------------- 4. media collect
-  const MEDIA_EXT_RE = /\.(mp4|webm|mov|avi|mkv|m4v|m3u8|mp3|wav|m4a|ogg|flac|pdf|pptx?|docx?|xlsx?|csv|zip|rar|7z|pka|pkt|json|xml|png|jpe?g|gif|webp|svg|bmp|ico)(\?|$)/i;
+  const MEDIA_EXT_RE = /\.(mp4|webm|mov|avi|mkv|m4v|m3u8|mpd|mp3|wav|m4a|ogg|flac|pdf|pptx?|docx?|xlsx?|csv|zip|rar|7z|pka|pkt|json|xml|png|jpe?g|gif|webp|avif|svg|bmp|ico|vtt|srt)(?:[?#]|$)/i;
+  const KNOWN_EXT = /^(mp4|webm|mov|avi|mkv|m4v|m3u8|mpd|mp3|wav|m4a|ogg|flac|pdf|ppt|pptx|doc|docx|xls|xlsx|csv|zip|rar|7z|pka|pkt|json|xml|png|jpg|jpeg|gif|webp|avif|svg|bmp|ico|vtt|srt)$/i;
 
   function extFromUrl(url, ct) {
-    const m = url.match(/\.[a-z0-9]{2,5}(\?|$)/i);
-    if (m && /^(mp4|webm|mov|avi|mkv|m4v|m3u8|mp3|wav|m4a|ogg|flac|pdf|ppt|pptx|doc|docx|xls|xlsx|csv|zip|rar|7z|pka|pkt|json|xml|png|jpg|jpeg|gif|webp|svg|bmp|ico)$/i.test(m[1])) return "." + m[1].toLowerCase();
+    const m = String(url || "").match(/\.([a-z0-9]{2,5})(?:[?#]|$)/i);
+    if (m && KNOWN_EXT.test(m[1])) return "." + m[1].toLowerCase();
     if (ct) {
-      const map = { "image/png": ".png", "image/jpeg": ".jpg", "image/svg+xml": ".svg", "image/webp": ".webp", "image/gif": ".gif", "video/mp4": ".mp4", "video/webm": ".webm", "audio/mpeg": ".mp3", "application/pdf": ".pdf" };
-      if (map[ct.split(";")[0]]) return map[ct.split(";")[0]];
+      const type = String(ct).split(";")[0].trim().toLowerCase();
+      const map = {
+        "image/png": ".png", "image/jpeg": ".jpg", "image/svg+xml": ".svg", "image/webp": ".webp",
+        "image/gif": ".gif", "image/avif": ".avif", "video/mp4": ".mp4", "video/webm": ".webm",
+        "video/quicktime": ".mov", "audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/ogg": ".ogg",
+        "application/pdf": ".pdf", "application/zip": ".zip", "application/json": ".json",
+        "application/vnd.apple.mpegurl": ".m3u8", "application/x-mpegurl": ".m3u8",
+        "text/plain": ".txt", "text/csv": ".csv", "text/markdown": ".md", "text/html": ".html",
+        "application/octet-stream": ".bin",
+      };
+      if (map[type]) return map[type];
+      if (/pdf/i.test(type)) return ".pdf";
     }
     return ".bin";
   }
 
+  function resolveMediaUrl(url, base) {
+    if (!url) return "";
+    if (/^(data|blob|https?):/i.test(url)) return url;
+    try { return new URL(url, base || location.href).href; } catch (e) { return ""; }
+  }
+
   function collectMedia(root, ctx) {
     const found = new Map(); // url -> entry
+    const base = (root && root.ownerDocument && root.ownerDocument.baseURI) || location.href;
     const add = (url, kind, name) => {
       if (!url) return;
+      if (/^(javascript|mailto|tel):/i.test(url)) return;
+      if (url.startsWith("blob:")) return; // not fetchable after the page unloads
       if (url.startsWith("data:")) {
         // keep data uris under their content hash
         const h = hashStr(url.slice(0, 4000));
         const key = "data:" + h;
-        if (!found.has(key)) found.set(key, { url, kind: kind || "file", name: name || h + extFromUrl("", url.includes("image") ? "image/png" : "") });
+        if (!found.has(key)) found.set(key, { url, kind: kind || "file", name: name || h + extFromUrl("", url.slice(5, url.indexOf(";"))) });
         return;
       }
       const key = url;
       if (!found.has(key)) found.set(key, { url, kind: kind || "file", name: name || null });
+    };
+    const addSrcset = (srcset, kind) => {
+      for (const part of String(srcset || "").split(",")) {
+        const url = part.trim().split(/\s+/)[0];
+        if (url) add(resolveMediaUrl(url, root && root.ownerDocument && root.ownerDocument.baseURI), kind);
+      }
     };
 
     for (const el of walkAll(root)) {
       const tag = el.tagName;
       if (tag === "IMG") {
         add(el.currentSrc || el.src, "image");
+        addSrcset(el.getAttribute("srcset"), "image");
       } else if (tag === "VIDEO" || tag === "AUDIO") {
-        add(el.src || el.currentSrc, tag === "VIDEO" ? "video" : "audio");
-        for (const s of el.querySelectorAll("source")) add(s.src, tag === "VIDEO" ? "video" : "audio");
+        add(el.currentSrc || el.src, tag === "VIDEO" ? "video" : "audio");
+        add(resolveMediaUrl(el.getAttribute("poster"), base), "image");
+        for (const s of el.querySelectorAll("source")) {
+          add(s.src, tag === "VIDEO" ? "video" : "audio");
+          addSrcset(s.getAttribute("srcset"), tag === "VIDEO" ? "video" : "audio");
+        }
+      } else if (tag === "TRACK") {
+        add(el.src, "file");
       } else if (tag === "A") {
         const href = el.href;
         if (href && MEDIA_EXT_RE.test(href)) add(href, "doc");
       } else if (tag === "OBJECT" || tag === "EMBED") {
-        add(el.data || el.src, "file");
+        add(resolveMediaUrl(el.data || el.src, base), "file");
       } else if (el.children.length <= 2) {
         try {
-          const bg = getComputedStyle(el).backgroundImage;
+          const view = el.ownerDocument && el.ownerDocument.defaultView;
+          const bg = view ? view.getComputedStyle(el).backgroundImage : "";
           if (bg && bg !== "none") {
             const m = bg.match(/url\((['"]?)(.*?)\1\)/);
-            if (m && m[2] && !m[2].startsWith("data:image/svg")) add(m[2], "image");
+            const u = m && m[2] ? resolveMediaUrl(m[2], el.ownerDocument.baseURI) : "";
+            if (u && !u.startsWith("data:image/svg")) add(u, "image");
           }
         } catch (e) {}
       }
@@ -448,13 +651,16 @@
   const AUTHORING_RE = /authoring-resources\/courses\/([^/]+)\/([^/]+)\/([^/?#]+)/;
 
   function detectManifest() {
-    // from this frame or any iframe
-    const urls = [location.href];
-    for (const f of document.querySelectorAll("iframe")) {
+    // From this frame, the active player first, then any other iframe.
+    const urls = [];
+    const active = activeIframe();
+    if (active) urls.push(iframeHref(active));
+    urls.push(location.href);
+    for (const f of queryAllDeep(document.documentElement, "iframe")) {
       // the iframe src attribute goes stale after in-iframe navigation; prefer the live document URL
       let u = f.src || "";
       try { u = f.contentWindow.location.href || u; } catch (e) {}
-      urls.push(u);
+      if (!urls.includes(u)) urls.push(u);
     }
     for (const u of urls) {
       // direct-path form: .../authoring-resources/courses/<cid>/<mid>/<lang>/...
@@ -462,19 +668,38 @@
       if (m) return { courseId: m[1], moduleId: m[2], lang: m[3], moduleNumber: null };
       // app form: .../authoring-resources/index.html?...&lang=XX&moduleNumber=N#/courses/<cid>/<mid>/id/<pid>
       if (/authoring-resources\/index\.html/.test(u)) {
-        const h = u.match(/#\/courses\/([^/?#]+)\/([^/?#]+)\/id\/([^/?#]+)/);
+        const h = u.match(/#\/courses\/([^/?#]+)\/([^/?#]+)(?:\/id\/([^/?#]+))?/);
         const lang = (u.match(/[?&]lang=([a-zA-Z0-9-]+)/) || [])[1] || "en-US";
         const mn = (u.match(/[?&]moduleNumber=(\d+)/) || [])[1] || null;
-        if (h) return { courseId: h[1], moduleId: h[2], pageId: h[3], lang, moduleNumber: mn };
+        if (h) return { courseId: h[1], moduleId: h[2], pageId: h[3] || null, lang, moduleNumber: mn };
       }
     }
     return null;
   }
 
   async function fetchText(url) {
-    const r = await fetch(url, { credentials: "include" });
-    if (!r.ok) return { ok: false, status: r.status };
-    return { ok: true, text: await r.text() };
+    const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 60000) : null;
+    try {
+      const r = await fetch(url, { credentials: "include", signal: ctrl ? ctrl.signal : undefined });
+      if (!r.ok) return { ok: false, status: r.status };
+      return { ok: true, text: await r.text() };
+    } catch (e) {
+      return { ok: false, status: "error", error: String((e && e.message) || e) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function absoluteAuthoringUrl(base, link) {
+    if (!link) return "";
+    try { return new URL(String(link), base).href; } catch (e) { return String(link); }
+  }
+
+  function assetPathOf(entry) {
+    if (typeof entry === "string") return entry;
+    if (entry && typeof entry === "object") return entry.path || entry.url || entry._path || entry.src || "";
+    return "";
   }
 
   async function fetchManifestFiles(courseId, moduleId, lang) {
@@ -487,16 +712,22 @@
     const cfg = await fetchText(base + "config.json");
     if (cfg.ok) out.files["config.json"] = cfg.text;
 
-    // assets
+    // assets: the platform has published both a bare array and wrapper
+    // objects over time; accept all of them.
     if (out.files[lang + "/assets.json"]) {
       try {
-        const list = JSON.parse(out.files[lang + "/assets.json"]);
+        const parsed = JSON.parse(out.files[lang + "/assets.json"]);
+        const list = Array.isArray(parsed) ? parsed
+          : (parsed && (parsed.assets || parsed._assets || parsed.items || parsed._items)) || [];
         if (Array.isArray(list)) {
           const seen = new Set();
-          for (const rel of list) {
-            if (typeof rel !== "string" || seen.has(rel)) continue;
-            seen.add(rel);
-            out.assets.push(base + rel.replace(/^\//, ""));
+          for (const entry of list) {
+            const rel = assetPathOf(entry);
+            if (!rel) continue;
+            const url = absoluteAuthoringUrl(base, rel);
+            if (!url || seen.has(url)) continue;
+            seen.add(url);
+            out.assets.push(url);
           }
         }
       } catch (e) {}
@@ -506,16 +737,24 @@
     if (out.files[lang + "/course.json"]) {
       try {
         const c = JSON.parse(out.files[lang + "/course.json"]);
-        const items = (c._resources && c._resources._resourcesItems) || [];
-        for (const it of items) {
-          const link = it._link || it._media;
-          if (!link) continue;
-          out.resources.push({
-            url: base + link.replace(/^\//, ""),
-            title: it.title || link.split("/").pop(),
-            description: it.description || "",
-            type: it._type || "file",
-          });
+        const res = c._resources || c.resources || {};
+        const items = Array.isArray(res) ? res
+          : (res._resourcesItems || res.items || res._items || []);
+        if (Array.isArray(items)) {
+          for (const it of items) {
+            if (!it) continue;
+            const link = it._link || it.link || it._media || it.url || "";
+            if (!link) continue;
+            const leaf = String(link).split("/").pop() || "resource";
+            let title = it.title || leaf;
+            try { title = decodeURIComponent(title); } catch (e) {}
+            out.resources.push({
+              url: absoluteAuthoringUrl(base, link),
+              title,
+              description: it.description || "",
+              type: it._type || it.type || "file",
+            });
+          }
         }
       } catch (e) {}
     }
@@ -536,6 +775,30 @@
       }
     });
   }
+  // Fetch bytes through the service worker first: it has host permissions and
+  // is not subject to the page's CORS policy. Same-origin page fetch is a
+  // fallback for a worker that failed for an unrelated reason.
+  async function fetchResourceBytes(url) {
+    const r = await bgFetch(url);
+    if (r && r.ok && typeof r.data === "string") {
+      return { ok: true, status: r.status || 200, type: r.type || "", size: r.size || 0, b64: r.data };
+    }
+    if (r && (r.error === "too large" || r.error === "timeout")) {
+      return { ok: false, status: r.status || "error", error: r.error, size: r.size || 0 };
+    }
+    try {
+      const fr = await fetch(url, { credentials: "include" });
+      if (!fr.ok) return { ok: false, status: fr.status, type: fr.headers.get("content-type") || "" };
+      const len = parseInt(fr.headers.get("content-length") || "0", 10);
+      if (len > MAX_PDF_BYTES) return { ok: false, status: 200, error: "too large" };
+      const buf = await fr.arrayBuffer();
+      if (buf.byteLength > MAX_PDF_BYTES) return { ok: false, status: 200, error: "too large" };
+      return { ok: true, status: 200, type: fr.headers.get("content-type") || "", size: buf.byteLength, b64: u8ToB64(new Uint8Array(buf)) };
+    } catch (e) {
+      return { ok: false, status: "error", error: String((e && e.message) || e) };
+    }
+  }
+
   // ------------------------------------------------ 6b. pdf capture
   // The "viewed ingredients" route: instead of only grabbing the raw file,
   // parse the document the course shows/links and keep its information as text.
@@ -571,28 +834,38 @@
     return lines.join("\n") + "\n\n";
   }
 
+  function withExt(name, ext) {
+    if (!ext) return name;
+    const escaped = ext.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(escaped + "$", "i").test(name) ? name : name + ext;
+  }
+
+  function uniqueResourceName(title, url, used) {
+    const base = sanitizeName(title || "resource", 80);
+    let name = base;
+    if (used.has(name)) name = sanitizeName(base.slice(0, 60) + "-" + hashStr(url).slice(0, 6), 80);
+    let i = 2;
+    while (used.has(name)) {
+      name = sanitizeName(base.slice(0, 60) + "-" + hashStr(url).slice(0, 6) + "-" + i++, 80);
+    }
+    used.add(name);
+    return name;
+  }
+
   // Capture one declared resource:
   //  - PDF reachable with the current session -> extract its text (pdf.js)
   //  - other reachable files -> raw bytes
   //  - unreachable (403/...) -> metadata stub so the resource is never lost
-  async function captureResource(entries, r, dir, used) {
-    let name = sanitizeName(r.title || "resource", 80);
-    if (used.has(name)) name = hashStr(r.url) + name;
-    used.add(name);
-    let fr = null, status = null, b64 = null;
-    try {
-      fr = await fetch(r.url, { credentials: "include" });
-      status = fr.status;
-      if (fr.ok) {
-        const buf = await fr.arrayBuffer();
-        if (buf.byteLength <= MAX_PDF_BYTES) b64 = u8ToB64(new Uint8Array(buf));
-      }
-    } catch (e) { status = "error"; }
-    const ct = fr && fr.ok ? (fr.headers.get("content-type") || "") : "";
+  async function captureResource(entries, r, dir, used, failures) {
+    const title = String(r.title || "resource");
+    const name = uniqueResourceName(title, r.url, used);
+    const res = await fetchResourceBytes(r.url);
+    const ct = res.type || "";
     const isPdf = isPdfUrl(r.url) || /pdf/i.test(ct);
-    if (fr && fr.ok && isPdf && b64) {
-      const ex = await extractPdfViaSW(b64);
-      const mdPath = dir + "/" + name + ".md";
+    const mdPath = dir + "/" + name + ".md";
+
+    if (res.ok && res.b64 && isPdf) {
+      const ex = await extractPdfViaSW(res.b64);
       if (ex && ex.ok && !ex.empty) {
         if (!entries.some((e) => e.path === mdPath)) {
           entries.push({
@@ -600,64 +873,79 @@
             text: pdfMetaMd(r, "**Extracted**: " + ex.pages + " page(s), " + ex.text.length + " chars of text via pdf.js (the document's content, not the raw file)") + ex.text,
           });
         }
-        log("pdf " + (r.title || name) + ": " + ex.pages + "p, " + ex.text.length + " chars");
+        log("pdf " + title + ": " + ex.pages + "p, " + ex.text.length + " chars");
         return mdPath;
       }
       // PDF but no text layer (scanned) or parse failure -> keep raw bytes + note
-      if (b64) await saveFileEntry(entries, dir, name + ".pdf", b64, false);
+      await saveFileEntry(entries, dir, withExt(name, ".pdf"), res.b64, false);
       if (!entries.some((e) => e.path === mdPath)) {
         entries.push({ path: mdPath, text: pdfMetaMd(r, (ex && ex.ok) ? "No extractable text layer (scanned/image PDF); raw file saved alongside" : "Extraction failed: " + (ex && ex.error) + "; raw file saved alongside") });
       }
-      log("pdf " + (r.title || name) + ": no text (" + (ex && ex.error || "scanned") + "), raw saved");
+      log("pdf " + title + ": no text (" + ((ex && ex.error) || "scanned") + "), raw saved");
       return mdPath;
     }
-    if (fr && fr.ok && b64) {
-      await saveFileEntry(entries, dir, name + (extFromUrl(r.url, ct) || ""), b64, false);
+    if (res.ok && res.b64) {
+      const rawName = withExt(name, isPdf ? ".pdf" : extFromUrl(r.url, ct));
+      await saveFileEntry(entries, dir, rawName, res.b64, false);
       return null;
     }
-    if (fr && fr.ok) {
-      // reachable but too big to copy -> stub with pointer
-      const mdPath = dir + "/" + name + ".md";
-      if (!entries.some((e) => e.path === mdPath)) entries.push({ path: mdPath, text: pdfMetaMd(r, "File reachable but over the copy limit; see source URL") });
-      return mdPath;
-    }
-    const mdPath = dir + "/" + name + ".md";
+    const why = res.error === "too large"
+      ? "File reachable but over the copy limit; see source URL"
+      : "**Status**: HTTP " + res.status + (res.error ? " (" + res.error + ")" : "") + " — not fetchable with the current session, no content captured";
     if (!entries.some((e) => e.path === mdPath)) {
-      entries.push({ path: mdPath, text: pdfMetaMd(r, "**Status**: HTTP " + status + " — not fetchable with the current session, no content captured") });
+      entries.push({ path: mdPath, text: pdfMetaMd(r, why) });
     }
-    log("resource " + (r.title || name) + ": HTTP " + status + " -> stub");
+    if (failures) failures.push("resource: " + title + " (" + (res.error === "too large" ? "too large" : "HTTP " + res.status) + ", stub only)");
+    log("resource " + title + ": " + (res.error === "too large" ? "too large" : "HTTP " + res.status) + " -> stub");
     return mdPath;
   }
 
   // Capture PDFs currently rendered inside the player (the on-screen route):
   // Chrome's native PDF viewer exposes no DOM text layer, so we fetch the same
   // document the viewer is showing and parse it.
-  async function captureViewedPdfs(entries, dir, seen) {
+  async function captureViewedPdfs(entries, dir, seen, failures) {
     const f = activeIframe();
     if (!f) return;
     let doc = null;
     try { doc = f.contentDocument; } catch (e) { return; }
     if (!doc) return;
-    const vids = [...doc.querySelectorAll('iframe[src*=".pdf"], embed[type="application/pdf"], object[type="application/pdf"]')];
+    const vids = [];
+    for (const el of walkAll(doc.documentElement)) {
+      if (el.tagName === "IFRAME" && isPdfUrl(el.src || "")) vids.push(el);
+      else if ((el.tagName === "EMBED" || el.tagName === "OBJECT") && /pdf/i.test(el.getAttribute("type") || "")) vids.push(el);
+    }
     for (const v of vids) {
       const src = v.src || v.data || "";
       if (!src || seen.has(src)) continue;
       seen.add(src);
+      let nm = mediaNameFor(src, "pdf", 0);
+      if (!/\.pdf$/i.test(nm)) nm = nm.replace(/\.[a-z0-9]{1,5}$/i, "") + ".pdf";
+      const mdPath = dir + "/pdf/" + nm + ".md";
       try {
-        const fr = await fetch(src, { credentials: "include" });
-        if (!fr.ok) { log("viewed pdf " + src + " -> HTTP " + fr.status); continue; }
-        const buf = await fr.arrayBuffer();
-        if (buf.byteLength > MAX_PDF_BYTES) { log("viewed pdf too big (" + buf.byteLength + ")"); continue; }
-        const ex = await extractPdfViaSW(u8ToB64(new Uint8Array(buf)));
+        const res = await fetchResourceBytes(src);
+        if (!res.ok) {
+          log("viewed pdf " + src + " -> " + (res.error || "HTTP " + res.status));
+          if (!entries.some((e) => e.path === mdPath)) {
+            entries.push({ path: mdPath, text: "## PDF: " + nm + "\n\nSource: " + src + "\n\nNot fetchable: " + (res.error || "HTTP " + res.status) + "\n" });
+          }
+          if (failures) failures.push("viewed pdf: " + src + " (" + (res.error || "HTTP " + res.status) + ")");
+          continue;
+        }
+        const ex = await extractPdfViaSW(res.b64);
         if (ex && ex.ok && !ex.empty) {
-          const nm = mediaNameFor(src, "pdf", 0);
-          const p = dir + "/pdf/" + nm + ".md";
-          if (!entries.some((e) => e.path === p)) entries.push({ path: p, text: "## PDF: " + nm + "\n\n" + ex.text });
+          if (!entries.some((e) => e.path === mdPath)) entries.push({ path: mdPath, text: "## PDF: " + nm + "\n\n" + ex.text });
           log("viewed pdf " + nm + ": " + ex.pages + "p, " + ex.text.length + " chars");
         } else {
+          await saveFileEntry(entries, dir + "/pdf", nm, res.b64, false);
+          if (!entries.some((e) => e.path === mdPath)) {
+            entries.push({ path: mdPath, text: "## PDF: " + nm + "\n\nSource: " + src + "\n\nNo extractable text layer" + ((ex && ex.error) ? ": " + ex.error : "") + "; raw file saved alongside\n" });
+          }
           log("viewed pdf " + src + ": no text layer" + (ex && ex.error ? " (" + ex.error + ")" : ""));
         }
-      } catch (e) { log("viewed pdf failed: " + (e.message || e)); }
+      } catch (e) {
+        log("viewed pdf failed: " + ((e && e.message) || e));
+        if (failures) failures.push("viewed pdf: " + src + " (" + ((e && e.message) || e) + ")");
+      }
     }
   }
 
@@ -670,17 +958,6 @@
     return hashStr(url + "\n" + t.head + "\n" + t.tail) + ":" + t.total;
   }
 
-  async function extractPageInFrame() {
-    const doc = document;
-    const root = findContentRoot(doc);
-    const { md, ctx } = docToMarkdown(root);
-    const html = root ? root.innerHTML : "";
-    const title = document.title.replace(/\s*\|\s*.*$/, "").trim() || "page";
-    const media = collectMedia(root || doc.body, ctx);
-    const manifest = detectManifest();
-    return { title, md, html, media, manifest, url: location.href };
-  }
-
   // iframe bridge: parent (top frame) asks, this frame answers
   function contentDocOf(iframe) {
     try {
@@ -688,16 +965,6 @@
       if (d && d.body) return d;
     } catch (e) {}
     return null;
-  }
-
-  function iframeSignature(iframe) {
-    const d = contentDocOf(iframe);
-    if (!d) return null;
-    let best = null;
-    for (const el of walkAll(d.documentElement)) {
-      if (el.id === "Wrapper" || el.tagName === "PAGE-VIEW") { best = el; break; }
-    }
-    return best ? pageSignature(best) : null;
   }
 
   // ------------------------------------------------- 8. outline
@@ -718,20 +985,81 @@
       .trim();
   }
 
-  // returns [{ module, modEl, subs: [{ title, btnEl, containerEl }] }]
+  // returns [{ module, modEl, moduleNumber, subs: [{ title, btnEl, containerEl }] }]
   function parseOutline(doc) {
     const groups = [];
-    for (const mod of doc.querySelectorAll("[class*=nodeContainer]")) {
-      const header = mod.querySelector("[class*=nodeInfoContainerWrapper]");
+    const allMods = queryAllDeep(doc.documentElement, "[class*=nodeContainer]");
+    // A module may contain progress steps that also use nodeContainer; keep
+    // only containers that are not nested inside another module container.
+    const mods = allMods.filter((m) => !allMods.some((o) => o !== m && o.contains(m)));
+    for (const mod of mods) {
+      const header = queryAllDeep(mod, "[class*=nodeInfoContainerWrapper]")[0];
       if (!header) continue;
+      const moduleTitle = cleanOutlineText(shadowText(header));
+      const moduleNumber = (moduleTitle.match(/Module\s*(\d+)/i) || [])[1] || null;
+      const allSubs = queryAllDeep(mod, "[class*=subModuleContainer]");
       const subs = [];
-      for (const c of mod.querySelectorAll("[class*=subModuleContainer]")) {
-        const btn = c.querySelector("button[class*=subModuleBtn]") || c;
-        subs.push({ title: cleanOutlineText(btn.textContent), btnEl: btn, containerEl: c });
+      for (const c of allSubs) {
+        if (allSubs.some((o) => o !== c && o.contains(c))) continue;
+        const btn = queryAllDeep(c, "button[class*=subModuleBtn]")[0] || queryAllDeep(c, "button")[0] || c;
+        const title = cleanOutlineText(btn.getAttribute("aria-label") || shadowText(btn));
+        subs.push({ title, btnEl: btn, containerEl: c });
       }
-      groups.push({ module: cleanOutlineText(header.textContent), modEl: header, subs });
+      groups.push({ module: moduleTitle, modEl: header, moduleNumber, subs });
     }
     return groups;
+  }
+
+  function moduleButton(group) {
+    let modEl = group && group.modEl;
+    if (group && (!modEl || !modEl.isConnected)) {
+      const fresh = parseOutline(document);
+      const fg = fresh.find((x) => x.module === group.module) || fresh[0];
+      if (fg) modEl = fg.modEl;
+    }
+    const buttons = modEl ? queryAllDeep(modEl, "button") : [];
+    return buttons.find((b) => /module/i.test(typeof b.className === "string" ? b.className : "")) ||
+      buttons.find((b) => b.hasAttribute("aria-expanded")) ||
+      buttons[0] ||
+      modEl ||
+      null;
+  }
+
+  function subButton(group, sub) {
+    if (sub && sub.btnEl && sub.btnEl.isConnected) return sub.btnEl;
+    if (!group) return sub ? sub.btnEl : null;
+    const fresh = parseOutline(document).find((x) => x.module === group.module);
+    const fs = fresh && fresh.subs.find((s) => s.title === sub.title);
+    return (fs && fs.btnEl) || (sub && sub.btnEl) || null;
+  }
+
+  function titleOf(obj, lang) {
+    const t = obj && obj.title;
+    if (typeof t === "string") return t;
+    if (t && typeof t === "object") {
+      return t[lang] || t["en-US"] || Object.values(t).find((v) => typeof v === "string") || "";
+    }
+    return "";
+  }
+
+  function contentObjectPages(objs, lang) {
+    const list = Array.isArray(objs) ? objs
+      : (objs && (objs.contentObjects || objs.items || objs._items || objs.pages)) || [];
+    if (!Array.isArray(list)) return [];
+    const pages = [];
+    const seen = new Set();
+    for (const o of list) {
+      if (!o || !o._id || seen.has(o._id)) continue;
+      const type = String(o._type || "").toLowerCase();
+      if (type && type !== "page" && type !== "contentobject") continue;
+      // Hidden content objects are Packet Tracer launcher shells (a loader
+      // image and an unresolved title); the .pka files themselves are captured
+      // from assets.json. Skip the shells so the ZIP has no empty lesson dirs.
+      if (o._isHidden || o._hidden || o._visible === false) continue;
+      seen.add(o._id);
+      pages.push({ id: o._id, title: titleOf(o, lang) });
+    }
+    return pages;
   }
 
 
@@ -744,6 +1072,8 @@
     const doc = document;
     const host = doc.createElement("div");
     host.id = "__ngbPanelHost";
+    host.setAttribute("role", "dialog");
+    host.setAttribute("aria-label", "NetAcad Grabber");
     Object.assign(host.style, {
       position: "fixed", right: "12px", bottom: "12px", zIndex: "2147483647",
       fontFamily: "system-ui, sans-serif", fontSize: "13px",
@@ -772,23 +1102,31 @@
       host,
       status: host.querySelector('[data-ngb="status"]'),
       logEl: host.querySelector('[data-ngb="log"]'),
+      button(act) { return host.querySelector('button[data-ngb="' + act + '"]'); },
       setStatus(t) {
         this.status.textContent = t;
         this.logEl.textContent = NG.buffer.join("\n");
       },
+      setBusy(on) {
+        for (const act of ["copy", "page", "course"]) {
+          const b = this.button(act);
+          if (b) b.disabled = !!on;
+        }
+      },
     };
+    ui.setBusy(busy);
     host.addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-ngb]");
+      const target = e.target && e.target.closest ? e.target : null;
+      const b = target && target.closest("button[data-ngb]");
       if (!b) return;
       const act = b.getAttribute("data-ngb");
-      if (act === "close") host.remove();
+      if (act === "close") closeUI();
       else if (act === "copy") onCopyText();
       else if (act === "page") onSavePage();
       else if (act === "course") onDownloadCourse();
     });
     // re-sync status on interval (cheap)
-    setInterval(() => { if (ui && ui.status) ui.setStatus(NG.last || ""); }, 1500);
-    host.addEventListener("mouseenter", () => host.style.display = "block");
+    ui.timer = setInterval(() => { if (ui) ui.setStatus(NG.last || ""); }, 1500);
   }
 
   NG.buffer = [];
@@ -819,7 +1157,7 @@
   function activeIframe() {
     let best = null, bestArea = 0;
     let bestAuthoring = null, bestAuthoringArea = 0;
-    for (const f of document.querySelectorAll("iframe")) {
+    for (const f of queryAllDeep(document.documentElement, "iframe")) {
       const r = f.getBoundingClientRect();
       const area = r.width * r.height;
       if (area <= 0) continue;
@@ -853,6 +1191,13 @@
 
 
   function courseTitle() {
+    // The launch page title is often just "Course Launch"; the visible H1 has
+    // the real course name.
+    const el = queryAllDeep(document.documentElement, "h1[class*=courseTitle], [class*=courseNameContainer] h1, h1[class*=courseName]")[0];
+    if (el) {
+      const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (t) return t;
+    }
     const t = (document.title || "")
       .replace(/^Cisco Networking Academy:\s*/, "")
       .replace(/\s*[|–—-]\s*(Cisco Networking Academy|Course Launch).*$/, "")
@@ -906,7 +1251,7 @@
         const pagePart = rawTitle.includes("|") ? rawTitle.split("|").pop().trim() : "";
         return {
           doc: d, root, md, ctx,
-          html: root ? root.innerHTML : "",
+          html: expandMd(cleanInnerHtml(root), manifest),
           title: expandTemplate(rawTitle.replace(/\s*\|\s*.*$/, "").trim() || "page", manifest),
           pageTitle: pagePart,
           media: collectMedia(root || d.body, ctx),
@@ -921,12 +1266,38 @@
     const md = expandMd(rawMd, manifest);
     return {
       doc: document, root, md, ctx,
-      html: root ? root.innerHTML : "",
+      html: expandMd(cleanInnerHtml(root), manifest),
       title: expandTemplate(document.title.replace(/\s*\|\s*.*$/, "").trim() || "page", manifest),
+      pageTitle: "",
       media: collectMedia(root, ctx),
       manifest,
       iframe: null,
     };
+  }
+
+  async function copyTextToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {}
+    // The clipboard API needs a focused document and often loses the user
+    // activation while settleContent() runs. execCommand still works in a
+    // content script with the clipboardWrite permission.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    ta.style.top = "0";
+    (document.body || document.documentElement).appendChild(ta);
+    let ok = false;
+    try {
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      ok = document.execCommand("copy");
+    } catch (e) {}
+    ta.remove();
+    return ok;
   }
 
   // ------------------------------------------------- 10. actions
@@ -934,10 +1305,13 @@
     try {
       await settleContent(12000);
       const c = await getActiveContent();
-      await navigator.clipboard.writeText("# " + c.title + "\n\n" + c.md);
-      log("Copied " + c.title + " (" + c.md.length + " chars) to clipboard");
+      if (!c.md.trim()) throw new Error("no lesson text found; open a page in the player first");
+      const label = (c.pageTitle && c.pageTitle !== c.title ? c.pageTitle : c.title) || "page";
+      const ok = await copyTextToClipboard("# " + label + "\n\n" + c.md);
+      if (!ok) throw new Error("clipboard write was rejected; copy from the panel's log instead");
+      log("Copied " + label + " (" + c.md.length + " chars) to clipboard");
     } catch (e) {
-      log("Copy failed: " + e.message);
+      log("Copy failed: " + ((e && e.message) || e));
     }
   }
 
@@ -956,33 +1330,32 @@
   }
 
   async function fetchAndAdd(entries, dir, url, name) {
-    const key = "fetch:" + url;
-    if (fetchCache.has(key)) {
-      const r = fetchCache.get(key);
-      if (r.ok) await saveFileEntry(entries, dir, name, r.data, false);
-      return r.ok;
-    }
-    const r = await bgFetch(url);
-    fetchCache.set(key, r);
-    if (r.ok) {
-      await saveFileEntry(entries, dir, name, r.data, false);
+    // fetchResourceBytes tries the service worker first and then the page
+    // origin, so same-origin media still works if the worker fetch is blocked.
+    const r = await fetchResourceBytes(url);
+    if (r.ok && r.b64) {
+      await saveFileEntry(entries, dir, name, r.b64, false);
       log("fetched " + name + " (" + r.size + " bytes)");
-    } else {
-      log("FAILED " + name + " -> " + (r.status || r.error));
+      return true;
     }
-    return r.ok;
+    log("FAILED " + name + " -> " + (r.status || r.error));
+    return false;
   }
-  const fetchCache = new Map();
 
   function mediaNameFor(url, kind, i) {
     let base;
     if (url.startsWith("data:")) {
-      base = "img-" + i + extFromUrl("", url.includes("image") ? "image/png" : "");
+      base = "img-" + i + dataUriInfo(url).ext;
     } else {
-      const u = new URL(url, location.href);
-      let p = decodeURIComponent(u.pathname.split("/").pop() || "");
-      if (!/\.[a-z0-9]{2,5}$/i.test(p)) p += extFromUrl(url, "");
-      base = (p.length > 60 ? hashStr(url) + p.slice(-20) : p);
+      let p = "";
+      try {
+        const u = new URL(url, location.href);
+        p = u.pathname.split("/").pop() || "";
+        try { p = decodeURIComponent(p); } catch (e) {}
+      } catch (e) { p = ""; }
+      p = p.replace(/[?#].*$/, "");
+      if (!/\.[a-z0-9]{2,5}$/i.test(p)) p = (p || "file") + extFromUrl(url, "");
+      base = (p.length > 60 ? hashStr(url).slice(0, 8) + "-" + p.slice(-50) : p);
     }
     return sanitizeName(base, 80);
   }
@@ -1009,9 +1382,9 @@
     const comma = url.indexOf(",");
     const meta = comma >= 0 ? url.slice(5, comma) : "";
     const payload = comma >= 0 ? url.slice(comma + 1) : "";
-    const mime = (meta.split(";")[0] || "application/octet-stream").toLowerCase();
+    const mime = (meta.split(";")[0].trim() || "application/octet-stream").toLowerCase();
     const ext = extFromUrl("", mime);
-    if (/;base64(;|$)/i.test(meta)) return { value: payload, isText: false, ext };
+    if (/;base64(;|$)/i.test(meta)) return { value: payload.replace(/\s+/g, ""), isText: false, ext };
     let text = payload;
     try { text = decodeURIComponent(payload); } catch (e) {}
     return { value: text, isText: true, ext };
@@ -1027,17 +1400,6 @@
     return out;
   }
 
-  function buildMediaIndex(ctx, entries, lessonDir) {
-    ctx.mediaIndex = new Map();
-    const used = new Set();
-    for (const m of ctx.media) {
-      let name = mediaNameFor(m.url, m.kind, 0);
-      if (used.has(name)) name = hashStr(m.url) + name;
-      used.add(name);
-      ctx.mediaIndex.set(m.url, lessonDir + "/media/" + name);
-    }
-  }
-
   function b64ToU8(b64) {
     const bin = atob(b64);
     const u8 = new Uint8Array(bin.length);
@@ -1045,54 +1407,62 @@
     return u8;
   }
 
+  function zipPath(path) {
+    const parts = String(path || "").replace(/\\/g, "/").split("/");
+    const clean = [];
+    for (const part of parts) {
+      if (!part || part === "." || part === "..") continue;
+      clean.push(part);
+    }
+    return clean.join("/");
+  }
+
   // Zip in this (page) context. Primary download is an <a download> click; the
-  // background blob:/data: path is only a fallback if the anchor path throws.
+  // service worker data: path is only a fallback if the anchor path throws.
   async function packageAndSave(entries, filename) {
     const files = {};
     for (const f of entries) {
-      const p = (f.path || "").replace(/^\/+/, "");
+      const p = zipPath(f.path);
       if (!p) continue;
-      files[p] = f.data ? b64ToU8(f.data) : new TextEncoder().encode(f.text || "");
+      let target = p;
+      for (let n = 2; Object.prototype.hasOwnProperty.call(files, target); n++) {
+        const dot = p.lastIndexOf(".");
+        target = dot > 0 ? p.slice(0, dot) + "-" + n + p.slice(dot) : p + "-" + n;
+      }
+      files[target] = f.data ? b64ToU8(f.data) : new TextEncoder().encode(f.text || "");
     }
     const zipped = fflate.zipSync(files, { level: 6 });
+    const safeName = sanitizeName(filename, 180);
+    const withZip = /\.zip$/i.test(safeName) ? safeName : safeName + ".zip";
 
     try {
       const blob = new Blob([zipped], { type: "application/zip" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = filename;
+      a.download = withZip;
       a.style.display = "none";
       (document.body || document.documentElement).appendChild(a);
       a.click();
       a.remove();
-      // The download owns the blob reference now; page teardown cleans it up.
-      return { ok: true, via: "anchor" };
+      setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+      return { ok: true, via: "anchor", filename: withZip };
     } catch (e) {
-      log("anchor download failed: " + (e.message || e));
+      log("anchor download failed: " + ((e && e.message) || e));
     }
 
     let b64 = "";
     try {
       const candidate = u8ToB64(zipped);
       if (candidate.length < 48e6) b64 = candidate;
-    } catch (e) { log("zip base64 encode failed: " + (e.message || e)); }
-
-    let blobUrl = null;
-    try {
-      const blob = new Blob([zipped], { type: "application/zip" });
-      blobUrl = URL.createObjectURL(blob);
-    } catch (e) { log("blob create failed: " + (e.message || e)); }
-
-    if (!blobUrl && !b64) return { ok: false, error: "zip fallback unavailable (too large and no blob URL)" };
+    } catch (e) { log("zip base64 encode failed: " + ((e && e.message) || e)); }
+    if (!b64) return { ok: false, error: "ZIP is too large for the fallback download; the anchor path failed" };
 
     const res = await new Promise((resolve) => {
       try {
-        chrome.runtime.sendMessage({ type: "saveZip", filename, blobUrl, b64, fileCount: Object.keys(files).length }, resolve);
+        chrome.runtime.sendMessage({ type: "saveZip", filename: withZip, b64, fileCount: Object.keys(files).length }, resolve);
       } catch (e) { resolve({ ok: false, error: String(e) }); }
     });
-    // keep the fallback blob alive a little while for the download to grab it
-    setTimeout(() => { if (blobUrl) { try { URL.revokeObjectURL(blobUrl); } catch (e) {} } }, 60000);
     return res;
   }
   async function onSavePage() {
@@ -1100,9 +1470,12 @@
       log("Extracting current page...");
       await settleContent(12000);
       const c = await getActiveContent();
-      const dirName = (c.pageTitle && c.pageTitle !== c.title ? c.pageTitle : c.title);
-      const dir = sanitizeName(courseTitle(), 40) + "/pages/" + sanitizeName(dirName, 50);
+      if (!c.md.trim() && !c.media.length) throw new Error("no lesson content found; open a page in the player first");
+      const dirName = sanitizeName((c.pageTitle && c.pageTitle !== c.title ? c.pageTitle : c.title), 70);
+      const courseDir = sanitizeName(courseTitle(), 80);
+      const dir = courseDir + "/pages/" + dirName;
       const entries = [];
+      const failures = [];
       const mediaPathByUrl = new Map();
       const usedNames = new Set();
       for (const m of c.media) {
@@ -1115,20 +1488,23 @@
           const name = uniqueMediaName(mediaNameFor(m.url, m.kind, 0), m.url, usedNames);
           const ok = await fetchAndAdd(entries, dir + "/media", m.url, name);
           if (ok) mediaPathByUrl.set(m.url, "media/" + name);
+          else failures.push("media: " + m.url);
         }
       }
       const md = rewriteMediaLinks(c.md, mediaPathByUrl);
-      entries.push({ path: dir + "/content.md", text: "# " + c.title + "\n\n" + md });
-      entries.push({ path: dir + "/content.html", text: "<!doctype html><meta charset=utf-8><title>" + c.title + "</title>" + c.html });
-      if (c.manifest) {
+      const pageLabel = (c.pageTitle && c.pageTitle !== c.title ? c.pageTitle : c.title) || "page";
+      entries.push({ path: dir + "/content.md", text: "# " + pageLabel + "\n\n" + md });
+      entries.push({ path: dir + "/content.html", text: "<!doctype html><meta charset=utf-8><title>" + escapeHtml(pageLabel) + "</title>" + c.html });
+      if (c.manifest && c.manifest.courseId && c.manifest.moduleId) {
         const mf = await fetchManifestFiles(c.manifest.courseId, c.manifest.moduleId, c.manifest.lang);
         for (const [rel, text] of Object.entries(mf.files)) {
           await saveFileEntry(entries, dir + "/raw", rel.replace(/\//g, "__"), text, true);
         }
       }
-      await captureViewedPdfs(entries, dir, new Set());
-      const res = await packageAndSave(entries, dir + ".zip");
-      if (res && res.ok) log("Saved " + dir + ".zip (" + entries.length + " files, root=" + (c.root.tagName + "#" + (c.root.id || "")) + ", md=" + md.length + ", via " + (res.via || "?") + ")");
+      await captureViewedPdfs(entries, dir, new Set(), failures);
+      if (failures.length) entries.push({ path: dir + "/FAILURES.txt", text: failures.join("\n") + "\n" });
+      const res = await packageAndSave(entries, courseDir + " - " + dirName + ".zip");
+      if (res && res.ok) log((failures.length ? "Saved (partial) " : "Saved ") + (res.filename || "page.zip") + " (" + entries.length + " files, root=" + (c.root.tagName + "#" + (c.root.id || "")) + ", md=" + md.length + ", via " + (res.via || "?") + ")");
       else log("Save failed: " + (res && res.error));
     } catch (e) {
       log("Save page failed: " + (e.message || e));
@@ -1140,6 +1516,7 @@
   async function onDownloadCourse() {
     if (busy) { log("Already running"); return; }
     busy = true;
+    if (ui) ui.setBusy(true);
     const capturedPages = [];
     try {
       log("Scanning course outline...");
@@ -1148,23 +1525,44 @@
         log("No course outline found. Try 'Save this page' instead.");
         return;
       }
-      const courseDir = sanitizeName(courseTitle(), 40);
+      const courseDir = sanitizeName(courseTitle(), 80);
       const entries = [];
-      const savedDirs = new Set();
+      const failures = [];
+      const capturedDirs = new Set();
       const viewedPdfSeen = new Set(); // dedupe viewed-PDF captures across the walk
+      const resourceByUrl = new Map(); // URL -> path in the ZIP
+      const resourceByKey = new Set(); // title + leaf, same resource in two modules
+      const usedResourceNames = new Set();
 
       // iframe route info: courseId + lang + moduleNumber (courseId is constant per course)
-      const baseRoute = (() => {
-        const f = activeIframe();
-        let u = f ? (f.src || "") : location.href;
-        if (f) { try { u = f.contentWindow.location.href || f.src; } catch (e) {} }
-        const h = u.match(/#\/courses\/([^/?#]+)\/([^/?#]+)\/id\/([^/?#]+)/);
-        const lang = (u.match(/[?&]lang=([a-zA-Z0-9-]+)/) || [])[1] || "en-US";
-        const mn = (u.match(/[?&]moduleNumber=(\d+)/) || [])[1] || null;
-        return { courseId: h ? h[1] : null, moduleId: h ? h[2] : null, lang, moduleNumber: mn };
-      })();
-
+      const detected = detectManifest() || {};
+      let playerUrl = location.href;
+      const f0 = activeIframe();
+      if (f0) playerUrl = iframeHref(f0) || playerUrl;
+      const hash = playerUrl.match(/#\/courses\/([^/?#]+)\/([^/?#]+)\/id\/([^/?#]+)/);
+      const lang = (playerUrl.match(/[?&]lang=([a-zA-Z0-9-]+)/) || [])[1];
+      const mn = (playerUrl.match(/[?&]moduleNumber=(\d+)/) || [])[1];
+      const baseRoute = {
+        courseId: detected.courseId || (hash && hash[1]) || null,
+        moduleId: detected.moduleId || (hash && hash[2]) || null,
+        lang: detected.lang || lang || "en-US",
+        moduleNumber: detected.moduleNumber || mn || null,
+      };
       const readSig = currentSig;
+      // Content-only signature (no URL, no document title): the hash updates
+      // before the SPA paints, so URL changes alone must not prove navigation.
+      const readContentSig = () => {
+        const f = activeIframe();
+        const d = f ? contentDocOf(f) : null;
+        if (!d) return "none";
+        let root = null;
+        for (const el of walkAll(d.documentElement)) {
+          if (el.id === "Wrapper" || el.tagName === "PAGE-VIEW" || el.tagName === "ARTICLE-VIEW") { root = el; break; }
+        }
+        if (!root) return "none";
+        const t = shadowTextParts(root, 6000, 2000);
+        return hashStr(t.head + "\n" + t.tail) + ":" + t.total;
+      };
 
       // navigate the active iframe to a page of a given content module (hash routing)
       const gotoPage = (moduleId, pageId, moduleNumber) => {
@@ -1186,35 +1584,121 @@
       const iframeHasPageId = (pageId) => {
         if (!pageId) return false;
         const f = activeIframe();
-        return !!(f && iframeHref(f).includes("/id/" + pageId));
+        if (!f) return false;
+        return new RegExp("/id/" + escapeRegExp(pageId) + "(?:[?#]|$)").test(iframeHref(f));
       };
 
-      const waitForPage = async (beforeSig, expectedPageId, timeoutMs) => {
-        const deadline = Date.now() + (timeoutMs || 90000);
-        let stable = 0, lastSig = null;
+      const normTitle = (s) => String(s || "")
+        .toLowerCase()
+        .replace(/\{\{[^}]*\}\}/g, " ")
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim();
+      const iframeTitleHas = (label) => {
+        const want = normTitle(label);
+        if (!want) return true;
+        const f = activeIframe();
+        const d = f ? contentDocOf(f) : null;
+        return !!(d && normTitle(d.title).includes(want));
+      };
+
+      const waitForRoute = async (moduleId, timeoutMs) => {
+        const deadline = Date.now() + (timeoutMs || 15000);
+        const re = new RegExp("/(?:courses/[^/?#]+/)?" + escapeRegExp(moduleId) + "(?:/|[?#]|$)");
         while (Date.now() < deadline) {
-          await sleep(1200);
+          const f = activeIframe();
+          if (f && re.test(iframeHref(f))) return true;
+          await sleep(300);
+        }
+        return false;
+      };
+
+      // The player may not have mounted a page yet when the panel is opened.
+      // Once a module header is clicked, the iframe URL carries the course id;
+      // refresh the route without freezing the walker on the initial null.
+      const refreshRoute = () => {
+        const d = detectManifest() || {};
+        if (d.courseId) baseRoute.courseId = d.courseId;
+        if (d.lang) baseRoute.lang = d.lang;
+        if (d.moduleNumber) baseRoute.moduleNumber = d.moduleNumber;
+      };
+      const waitForCourseRoute = async (timeoutMs) => {
+        const deadline = Date.now() + (timeoutMs || 15000);
+        while (Date.now() < deadline) {
+          const f = activeIframe();
+          if (f && /\/courses\/[^/?#]+\//.test(iframeHref(f))) return true;
+          await sleep(300);
+        }
+        return false;
+      };
+
+      const waitForPage = async (beforeSig, expectedPageId, timeoutMs, expectedLabel, alreadyThere) => {
+        const started = Date.now();
+        const deadline = started + (timeoutMs || 90000);
+        const beforeContent = readContentSig();
+        let stable = 0, lastSig = null, contentChanged = false;
+        while (Date.now() < deadline) {
+          await sleep(1000);
           const s = readSig();
-          if (s === beforeSig) {
-            // "already there" is only safe when the live route proves it
-            if (expectedPageId && iframeHasPageId(expectedPageId)) break;
-            continue;
-          } else {
-            if (s === lastSig) stable++;
-            else stable = 0;
-            lastSig = s;
-            if (stable >= 2) break;
+          if (readContentSig() !== beforeContent) contentChanged = true;
+          if (s === lastSig) stable++;
+          else { stable = 0; lastSig = s; }
+          if (stable >= 2) {
+            if (expectedPageId) {
+              // The hash updates synchronously but the SPA paints later. A
+              // route match alone is not enough: require either a real text
+              // change or a matching rendered title, or the previous page
+              // gets written under the new page's name.
+              if (!iframeHasPageId(expectedPageId)) continue;
+              if (contentChanged || !expectedLabel || iframeTitleHas(expectedLabel)) return true;
+              // The target was already the live route before navigation and
+              // the player gives no title match; give it a bounded settle.
+              if (alreadyThere && Date.now() - started > 8000) return true;
+              continue;
+            }
+            // No route target: a real content change is required.
+            return contentChanged;
           }
         }
+        return false;
+      };
+
+      const dirsByModule = new Map();
+      const usedDirPaths = new Set();
+      const lessonDirFor = (moduleLabel, label, key) => {
+        const mod = sanitizeName(moduleLabel || "Module", 70);
+        let map = dirsByModule.get(mod);
+        if (!map) { map = new Map(); dirsByModule.set(mod, map); }
+        if (map.has(key)) return map.get(key);
+        let dir = mod + "/" + sanitizeName(label || "page", 70);
+        if (usedDirPaths.has(dir)) {
+          const suffix = "-" + hashStr(String(key)).slice(0, 6);
+          dir = mod + "/" + sanitizeName((label || "page").slice(0, 70 - suffix.length) + suffix, 70);
+          let i = 2;
+          while (usedDirPaths.has(dir)) {
+            dir = mod + "/" + sanitizeName((label || "page").slice(0, 60) + "-" + i++, 70);
+          }
+        }
+        usedDirPaths.add(dir);
+        map.set(key, dir);
+        return dir;
       };
 
       // save whatever is currently displayed in the player
-      const saveCurrent = async (moduleLabel, pageTitle) => {
+      const saveCurrent = async (moduleLabel, pageTitle, key, moduleNumber, expectedLabel) => {
         const c = await getActiveContent();
-        const label = (c.pageTitle && c.pageTitle !== c.title ? c.pageTitle : expandTemplate(pageTitle || c.title, { moduleNumber: baseRoute.moduleNumber })) || c.title;
-        const dir = courseDir + "/lessons/" + sanitizeName(moduleLabel, 40) + "/" + sanitizeName(label, 60);
-        if (!savedDirs.has(dir)) {
-          savedDirs.add(dir);
+        let titleOk = true;
+        if (expectedLabel) {
+          const actual = normTitle(c.pageTitle || c.title);
+          const want = normTitle(expectedLabel);
+          titleOk = !!(actual && want && actual.includes(want));
+          if (!titleOk) log("page title differs (wanted \"" + expectedLabel + "\", got \"" + (c.pageTitle || c.title) + "\"); using requested label");
+        }
+        const label = (!expectedLabel || titleOk)
+          ? ((c.pageTitle && c.pageTitle !== c.title ? c.pageTitle : expandTemplate(pageTitle || c.title, { moduleNumber: moduleNumber || baseRoute.moduleNumber })) || c.title || "page")
+          : expectedLabel;
+        const dir = courseDir + "/lessons/" + lessonDirFor(moduleLabel, label, key || label);
+        if (!capturedDirs.has(dir)) {
+          capturedDirs.add(dir);
           const mediaPathByUrl = new Map();
           const usedNames = new Set();
           for (const m of c.media) {
@@ -1227,12 +1711,13 @@
               const name = uniqueMediaName(mediaNameFor(m.url, m.kind, 0), m.url, usedNames);
               const ok = await fetchAndAdd(entries, dir + "/media", m.url, name);
               if (ok) mediaPathByUrl.set(m.url, "media/" + name);
+              else failures.push("media: " + m.url + " (" + label + ")");
             }
           }
           const md = rewriteMediaLinks(c.md, mediaPathByUrl);
           entries.push({ path: dir + "/content.md", text: "# " + label + "\n\n" + md });
-          entries.push({ path: dir + "/content.html", text: "<!doctype html><meta charset=utf-8><title>" + label + "</title>" + c.html });
-          await captureViewedPdfs(entries, dir, viewedPdfSeen);
+          entries.push({ path: dir + "/content.html", text: "<!doctype html><meta charset=utf-8><title>" + escapeHtml(label) + "</title>" + c.html });
+          await captureViewedPdfs(entries, dir, viewedPdfSeen, failures);
         }
         capturedPages.push(label);
         return c;
@@ -1240,26 +1725,112 @@
 
       // fetch raw JSON + all assets + resources for one content module
       const fetchModuleAssets = async (moduleId) => {
+        if (!baseRoute.courseId) return;
         const mf = await fetchManifestFiles(baseRoute.courseId, moduleId, baseRoute.lang);
-        const mdir = courseDir + "/modules/" + moduleId.slice(0, 8);
+        const mdir = courseDir + "/modules/" + sanitizeName(moduleId.slice(0, 8), 40);
         for (const [rel, text] of Object.entries(mf.files)) {
-          await saveFileEntry(entries, mdir + "/raw", rel.replace(/\//g, "__"), text, true);
+          await saveFileEntry(entries, mdir + "/raw", rel.replace(/[\\/]/g, "__"), text, true);
         }
         let ai = 0;
         const assetNames = new Set();
         for (const aurl of mf.assets) {
           const name = uniqueMediaName(mediaNameFor(aurl, "asset", ai++), aurl, assetNames);
-          await fetchAndAdd(entries, mdir + "/assets", aurl, name);
+          const ok = await fetchAndAdd(entries, mdir + "/assets", aurl, name);
+          if (!ok) failures.push("asset: " + aurl + " (module " + moduleId.slice(0, 8) + ")");
         }
-        const usedRes = new Set();
+        let capturedResources = 0;
         for (const r of mf.resources) {
-          await captureResource(entries, r, courseDir + "/resources", usedRes);
+          const leaf = String(r.url || "").split("/").pop() || "";
+          const key = String(r.title || "") + "|" + leaf;
+          if (resourceByUrl.has(r.url) || resourceByKey.has(key)) continue;
+          resourceByKey.add(key);
+          const path = await captureResource(entries, r, courseDir + "/resources", usedResourceNames, failures);
+          resourceByUrl.set(r.url, path);
+          capturedResources++;
         }
-        log("module " + moduleId.slice(0, 8) + ": " + mf.assets.length + " assets, " + mf.resources.length + " resources");
+        log("module " + moduleId.slice(0, 8) + ": " + mf.assets.length + " assets, " + capturedResources + " resources");
+      };
+
+      // The Resources tab is separate from the outline/page JSON. Its items
+      // (standalone lab HTML + the resource-service PKA copies) are signed on
+      // click; mainworld.js hands us the URL before the browser downloads it.
+      const captureResourceTab = async () => {
+        const navLinks = queryAllDeep(document.documentElement, "a.nav-link");
+        const resLink = navLinks.find((a) => /^Resources$/i.test((a.textContent || "").trim()));
+        if (!resLink) return;
+        try {
+          resLink.click();
+          let buttons = [];
+          for (let i = 0; i < 30; i++) {
+            await sleep(300);
+            buttons = queryAllDeep(document.documentElement, 'button[aria-label^="Download File "]');
+            if (buttons.length) break;
+          }
+          if (!buttons.length) {
+            log("Resources tab: no downloadable items");
+            return;
+          }
+          window.postMessage({ __ngbMain: "resourceCapture", on: true }, "*");
+          await sleep(300);
+          const used = new Set();
+          let saved = 0;
+          for (const b of buttons) {
+            const label = (b.getAttribute("aria-label") || "").replace(/^Download File\s*/i, "").trim() || "resource";
+            resourceDownloadQueue.length = 0;
+            const wait = nextResourceDownload(15000);
+            b.click();
+            const d = await wait;
+            if (!d || !d.url) {
+              log("Resources tab: no signed URL for " + label);
+              failures.push("resource tab: " + label + " (no signed URL)");
+              continue;
+            }
+            const r = await bgFetch(d.url);
+            const base = sanitizeName(label.replace(/\s*\(pka\)\s*$/i, ""), 80);
+            if (!r || !r.ok) {
+              // The main-world hook suppressed the browser download, so do
+              // not lose the file: ask Chrome to download the signed URL.
+              let fext = extFromUrl(d.url, "");
+              if (/\(pka\)\s*$/i.test(label) && fext !== ".pka") fext = ".pka";
+              const fallbackName = withExt(base, fext || ".bin");
+              const fb = await new Promise((resolve) => {
+                try { chrome.runtime.sendMessage({ type: "downloadUrlDirect", url: d.url, filename: fallbackName }, resolve); }
+                catch (e) { resolve({ ok: false, error: String(e) }); }
+              });
+              const why = (r && (r.status || r.error)) || "no response";
+              if (fb && fb.ok) log("Resources tab: " + label + " -> fetch failed (" + why + "); saved via Downloads fallback");
+              else {
+                log("Resources tab: " + label + " -> " + why + " (fallback failed: " + ((fb && fb.error) || "?") + ")");
+                failures.push("resource tab: " + label + " (" + why + ")");
+              }
+              continue;
+            }
+            let ext = extFromUrl(d.url, r.type);
+            if (/\(pka\)\s*$/i.test(label) && ext !== ".pka") ext = ".pka";
+            let fname = withExt(base, ext || ".bin");
+            fname = uniqueMediaName(fname, d.url, used);
+            await saveFileEntry(entries, courseDir + "/resources", fname, r.data, false);
+            log("Resources tab: " + fname + " (" + r.size + " bytes)");
+            saved++;
+          }
+          log("Resources tab: " + saved + "/" + buttons.length + " files");
+        } catch (e) {
+          log("Resources tab failed: " + ((e && e.message) || e));
+        } finally {
+          window.postMessage({ __ngbMain: "resourceCapture", on: false }, "*");
+          const contentLink = queryAllDeep(document.documentElement, "a.nav-link")
+            .find((a) => /^Content$/i.test((a.textContent || "").trim()));
+          if (contentLink) contentLink.click();
+          await sleep(1000);
+        }
       };
 
       // ---- walk sections in outline order ----
       const total = groups.reduce((n, g) => n + g.subs.length, 0);
+      if (!total) {
+        log("Course outline has no sections (still collapsed or not rendered).");
+        return;
+      }
       const waitForIframe = async (ms) => {
         const t0 = Date.now();
         while (Date.now() - t0 < ms) {
@@ -1271,12 +1842,14 @@
       };
       const visitedModules = new Set();
       let idx = 0;
+      let noCourseLogged = false;
       for (const g of groups) {
         for (const sub of g.subs) {
           idx++;
           try {
             // the section button's aria-controls maps to its blocks region: "submodule-<contentModuleId>"
-            const ac = sub.btnEl ? sub.btnEl.getAttribute("aria-controls") : null;
+            const clickBtn = subButton(g, sub);
+            const ac = clickBtn ? clickBtn.getAttribute("aria-controls") : null;
             const moduleId = ac && /^submodule-/.test(ac) ? ac.replace(/^submodule-/, "") : null;
             if (moduleId && visitedModules.has(moduleId)) {
               log(idx + "/" + total + " " + sub.title + " (already captured)");
@@ -1287,64 +1860,102 @@
               // header button (not just the page button): the app rewrites the player URL
               // with this module's moduleNumber + launch key, which the page title/labels
               // expand from. Without it the app keeps the previous module's number.
-              const modBtn = (g.modEl && (g.modEl.querySelector("button") || g.modEl)) || sub.btnEl;
+              const modBtn = moduleButton(g) || clickBtn;
+              const beforeMount = readSig();
               if (modBtn) modBtn.click();
               const f = await waitForIframe(15000);
               if (!f) {
                 log(idx + "/" + total + " " + sub.title + " (player iframe missing)");
                 continue;
               }
-              if (!visitedModules.has(moduleId)) {
-                const base = "https://www.netacad.com/authoring-resources/courses/" + baseRoute.courseId + "/" + moduleId + "/" + baseRoute.lang + "/";
+              const modNum = g.moduleNumber || baseRoute.moduleNumber;
+              if (!baseRoute.courseId) {
+                await waitForCourseRoute(15000);
+                refreshRoute();
+              }
+              if (baseRoute.courseId) {
+                if (!(await waitForRoute(moduleId, 15000))) {
+                  log(idx + "/" + total + " " + sub.title + " (module route did not change; continuing)");
+                }
                 let pages = [];
+                const base = "https://www.netacad.com/authoring-resources/courses/" + baseRoute.courseId + "/" + moduleId + "/" + baseRoute.lang + "/";
                 const r = await fetchText(base + "contentObjects.json");
                 if (r.ok) {
-                  const objs = JSON.parse(r.text);
-                  if (Array.isArray(objs)) {
-                    pages = objs.filter((o) => o && o._type === "page" && o._id)
-                      .map((o) => ({ id: o._id, title: o.title || "" }));
-                  }
+                  try { pages = contentObjectPages(JSON.parse(r.text), baseRoute.lang); } catch (e) { log("contentObjects.json parse failed: " + (e.message || e)); }
+                } else {
+                  log("contentObjects.json unavailable (" + r.status + "); capturing the mounted page only");
                 }
                 if (pages.length) {
-                  // this module's number, for correct title/label expansion
-                  const modNum = (String(g.module).match(/Module\s*(\d+)/i) || [])[1] || baseRoute.moduleNumber;
                   for (const pg of pages) {
+                    const pageLabel = expandTemplate(pg.title, { moduleNumber: modNum }) || pg.id;
+                    const alreadyThere = iframeHasPageId(pg.id);
                     const beforeSig = readSig();
                     if (!gotoPage(moduleId, pg.id, modNum)) {
-                      log(idx + "/" + total + " " + (pg.title || pg.id) + " (navigation unavailable)");
+                      log(idx + "/" + total + " " + pageLabel + " (navigation unavailable)");
                       continue;
                     }
-                    await waitForPage(beforeSig, pg.id);
-                    const label = expandTemplate(pg.title, { moduleNumber: modNum });
-                    const c = await saveCurrent(g.module, label);
-                    log(idx + "/" + total + " " + label + " [root=" + (c.root.tagName + "#" + (c.root.id || "")) + ", md=" + c.md.length + "]");
+                    if (!(await waitForPage(beforeSig, pg.id, 90000, pageLabel, alreadyThere))) {
+                      log(idx + "/" + total + " " + pageLabel + " (navigation timed out; skipped)");
+                      failures.push("page: " + pageLabel + " (navigation timeout)");
+                      continue;
+                    }
+                    const c = await saveCurrent(g.module, pageLabel, pg.id, modNum, pageLabel);
+                    if (!c) {
+                      failures.push("page: " + pageLabel + " (identity mismatch)");
+                      continue;
+                    }
+                    log(idx + "/" + total + " " + pageLabel + " [root=" + (c.root.tagName + "#" + (c.root.id || "")) + ", md=" + c.md.length + "]");
                   }
                 } else {
-                  const beforeSig = readSig();
-                  await waitForPage(beforeSig, null, 15000);
-                  await saveCurrent(g.module, sub.title);
+                  const mounted = await waitForPage(beforeMount, null, 20000);
+                  if (!mounted) log(idx + "/" + total + " " + sub.title + " (no page list; captured the mounted view)");
+                  await saveCurrent(g.module, sub.title, "module:" + moduleId, modNum);
                   log(idx + "/" + total + " " + sub.title);
                 }
                 await fetchModuleAssets(moduleId);
-                visitedModules.add(moduleId);
+              } else {
+                // No course id: mount the module and capture whatever the player shows.
+                if (!noCourseLogged) {
+                  log("Could not determine the course id from the player URL; only the visible page per section will be captured.");
+                  noCourseLogged = true;
+                }
+                await waitForPage(beforeMount, null, 20000);
+                await saveCurrent(g.module, sub.title, "module:" + moduleId, modNum);
+                log(idx + "/" + total + " " + sub.title);
               }
+              visitedModules.add(moduleId);
             } else {
-              // native single-page section (survey / exam): the button navigates
+              // Native sections are surveys/exams/assessment launch pages. Do
+              // not click them: opening an exam can consume an attempt and the
+              // questions are explicitly out of scope. Other native sections
+              // still get captured from their current view.
+              if (/\b(exam|quiz|assessment|test|survey)\b/i.test(sub.title + " " + g.module)) {
+                log(idx + "/" + total + " " + sub.title + " (assessment/exam skipped)");
+                continue;
+              }
               const beforeSig = readSig();
-              if (sub.btnEl) sub.btnEl.click();
-              await waitForPage(beforeSig, null, 15000);
-              await saveCurrent(g.module, sub.title);
+              if (clickBtn) clickBtn.click();
+              const changed = await waitForPage(beforeSig, null, 20000);
+              if (!changed) log(idx + "/" + total + " " + sub.title + " (section did not change; capturing current view)");
+              await saveCurrent(g.module, sub.title, "native:" + idx, baseRoute.moduleNumber);
               log(idx + "/" + total + " " + sub.title);
             }
           } catch (e) {
-            log("section failed: " + e.message);
+            log("section failed: " + ((e && e.message) || e));
           }
         }
       }
 
+      if (!capturedPages.length) {
+        log("No lesson pages captured; ZIP not created (see log for navigation failures).");
+        return;
+      }
+      log("Capturing Resources tab...");
+      await captureResourceTab();
+
       // README + manifest
       const readme =
-        "# " + (document.title || courseDir) + "\n\n" +
+        "# " + courseTitle() + "\n\n" +
         "Source: " + location.href + "\n" +
         "Extracted: " + new Date().toISOString() + "\n" +
         "Pages: " + capturedPages.length + "\n\n" +
@@ -1352,47 +1963,74 @@
         "- lessons/<module>/<page>/content.md | content.html | media/*\n" +
         "- modules/<id>/raw/*.json (course data) | modules/<id>/assets/* (all lab/doc assets incl. .pka)\n" +
         "- resources/* (course resource documents)\n";
+      if (failures.length) {
+        entries.push({ path: courseDir + "/FAILURES.txt", text: failures.join("\n") + "\n" });
+      }
       entries.push({ path: courseDir + "/README.md", text: readme });
       entries.push({ path: courseDir + "/manifest.json", text: JSON.stringify({
         course: courseDir, source: location.href, date: new Date().toISOString(),
-        pages: capturedPages,
+        pages: capturedPages, failures,
       }, null, 2) });
 
       log("Packaging " + entries.length + " files...");
       const res = await packageAndSave(entries, courseDir + ".zip");
-      if (res && res.ok) log("DONE: " + courseDir + ".zip (" + entries.length + " files, via " + (res.via || "?") + "). Check your Downloads folder.");
+      if (res && res.ok) log((failures.length ? "DONE (partial)" : "DONE") + ": " + (res.filename || courseDir + ".zip") + " (" + entries.length + " files, via " + (res.via || "?") + "). Check your Downloads folder.");
       else log("ZIP failed: " + (res && res.error));
     } catch (e) {
-      log("Course download failed: " + (e.message || e));
+      log("Course download failed: " + ((e && e.message) || e));
     } finally {
       busy = false;
+      if (ui) ui.setBusy(false);
     }
   }
   let busy = false;
 
-  // blob-download capture: when background sees a downloadStarted with a blob: url,
-  // find the blob in this frame and ship its bytes
+  // blob-download capture: when background sees a downloadStarted with a blob:
+  // url, ask the main-world shim for the bytes and save them through the SW.
+  const capturedBlobUrls = new Set();
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === "downloadStarted" && msg.url && msg.url.startsWith("blob:")) {
-      const blob = objectUrlToBlob.get(msg.url);
-      if (!blob) return;
-      (async () => {
-        try {
-          const b64 = await blobToB64(blob);
-          const fname = (msg.filename || "download") + "-captured";
-          const res = await new Promise((resolve) =>
-            chrome.runtime.sendMessage({ type: "downloadUrl", url: msg.url, filename: fname }, resolve));
-          log("captured blob download: " + fname + " (" + blob.size + " bytes)");
-        } catch (e) { log("blob capture failed: " + e.message); }
-      })();
+    if (!msg || msg.type !== "downloadStarted" || !msg.url) return;
+    if (!msg.url.startsWith("blob:")) {
+      // Fallback if mainworld's anchor hook did not run (e.g. a non-anchor
+      // download): the signed resource URL is still useful to the walker.
+      if (/\/s\/[^/]+\/resources\//.test(msg.url)) {
+        pushResourceDownload({ url: msg.url, filename: msg.filename || "" });
+      }
+      return;
     }
+    if (capturedBlobUrls.has(msg.url)) return;
+    capturedBlobUrls.add(msg.url);
+    (async () => {
+      try {
+        const blob = await getPageBlob(msg.url, 15000);
+        if (!blob || !blob.ok) return; // another frame owns the object URL
+        const u8 = new Uint8Array(blob.data);
+        if (u8.byteLength > 40e6) { log("blob download too large to capture: " + u8.byteLength + " bytes"); return; }
+        const rawName = String(msg.filename || "").split(/[\\/]/).pop() || (msg.url.split("/").pop() || "download");
+        const dot = rawName.lastIndexOf(".");
+        const fname = dot > 0 ? rawName.slice(0, dot) + "-captured" + rawName.slice(dot) : rawName + "-captured";
+        const res = await new Promise((resolve) => {
+          try { chrome.runtime.sendMessage({ type: "saveAsset", filename: fname, mime: blob.type || msg.mime || "", b64: u8ToB64(u8) }, resolve); }
+          catch (e) { resolve({ ok: false, error: String(e) }); }
+        });
+        if (res && res.ok) log("captured blob download: " + fname + " (" + u8.byteLength + " bytes)");
+        else log("blob capture failed: " + ((res && res.error) || "no response"));
+      } catch (e) { log("blob capture failed: " + ((e && e.message) || e)); }
+    })();
   });
+
+  function closeUI() {
+    const host = document.getElementById("__ngbPanelHost");
+    if (ui) clearInterval(ui.timer);
+    if (host) host.remove();
+    ui = null;
+  }
 
   // action button toggles the panel
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "ngb-toggle") {
       if (IS_TOP) {
-        if (document.getElementById("__ngbPanelHost")) document.getElementById("__ngbPanelHost").remove();
+        if (document.getElementById("__ngbPanelHost")) closeUI();
         else buildUI();
       }
     }
@@ -1406,13 +2044,14 @@
       const s = (r && (r.stack || r.message)) || r || "unknown";
       try { log("UNHANDLED: " + String(s).slice(0, 700)); } catch (x) {}
     });
-    installUnlock();
-    installBlobHook();
+    installUnlock(true);
+    installPageBridge();
     if (IS_TOP) buildUI();
     // keep unlock alive against re-renders
     // Console debug hook: window.postMessage({__ngb:"extractPdf", b64:"...", seq:N})
     // runs the same extractPdf path used for course PDFs and posts the result back.
     window.addEventListener("message", (e) => {
+      if (e.source !== window) return;
       const d = e && e.data;
       if (!d || d.__ngb !== "extractPdf" || typeof d.b64 !== "string") return;
       (async () => {
@@ -1422,7 +2061,7 @@
         window.postMessage(out, "*");
       })();
     });
-    setInterval(() => { try { installUnlock(); } catch (e) {} }, 3000);
+    setInterval(() => { try { installUnlock(false); } catch (e) {} }, 3000);
     NG("ready" + (IS_TOP ? " (top frame, UI on)" : " (iframe)"));
   }
 

@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "NetAcad Course Grabber",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Bypasses NetAcad copy-blocking and downloads full courses (text, images, videos, PDFs, Packet Tracer labs) as a ZIP archive.",
-  "permissions": ["downloads"],
+  "minimum_chrome_version": "111",
+  "permissions": ["downloads", "clipboardWrite"],
   "host_permissions": [
     "https://*.netacad.com/*",
     "https://*.cisco.com/*",
@@ -18,6 +19,13 @@
   ],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
+    {
+      "matches": ["https://www.netacad.com/*", "https://*.netacad.com/*"],
+      "js": ["mainworld.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
     {
       "matches": ["https://www.netacad.com/*", "https://*.netacad.com/*"],
       "js": ["zip/fflate.min.js", "content.js"],

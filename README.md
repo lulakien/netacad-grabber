@@ -1,11 +1,13 @@
 # NetAcad Course Grabber
 
 A Manifest-V3 Chrome extension that turns a logged-in Cisco NetAcad course into
-one **ZIP in your Downloads folder**: every lesson as Markdown + HTML, all
-images, videos, **Packet Tracer `.pka` lab files**, course resource documents
-(PDFs extracted to text), and the course's own raw authoring JSON. Nothing is
-hardcoded to a particular course — it reads the course that is open in front of
-you. Works on the "Skills for All" platform (www.netacad.com).
+one **ZIP in your Downloads folder**: every lesson as Markdown (plus a light-DOM
+HTML snapshot), images, **Packet Tracer `.pka` lab files**, Resources-tab lab
+documents, course resource documents (PDFs extracted to text), and the course's
+own raw authoring JSON. Brightcove-hosted videos are recorded as their
+`video-id` and poster, not as protected stream binaries. Nothing is hardcoded to
+a particular course — it reads the course that is open in front of you. Works on
+the "Skills for All" platform (www.netacad.com).
 
 ---
 
@@ -61,8 +63,9 @@ Course Title/
 │       └── assets/           # every file the course lists as an asset,
 │                             # incl. all Packet Tracer .pka lab files
 └── resources/                # course-level resource documents
-    └── <Resource>.md         # PDFs as extracted text (or metadata stub when
-                              # the file itself is unreachable — see notes)
+    ├── <Resource>.md         # PDFs as extracted text (or metadata stub when
+    │                         # the file itself is unreachable — see notes)
+    └── <Lab>.html / <Lab>.pka # standalone Resources-tab downloads
 ```
 
 - `.pka` files open in [Cisco Packet Tracer](https://www.netacad.com/packet-tracer) (7.3+).
@@ -120,10 +123,13 @@ lessons, video lessons, Packet Tracer lab pages, surveys, exam start pages.
 `installUnlock()` runs periodically and:
 
 - injects a `<style>` forcing `user-select: text !important` on everything;
-- patches `EventTarget.prototype.addEventListener` in the isolated world so
-  the site's `contextmenu` / `copy` / `selectstart` / `dragstart` listeners
-  are wrapped to no-op;
 - clears inline `oncopy`/`onselectstart`/… attributes the site sets directly.
+
+The site's own `contextmenu` / `copy` / `selectstart` / `dragstart` listeners
+are wrapped to no-ops by `mainworld.js`, which is declared with
+`"world": "MAIN"` and runs at `document_start`. A normal content script lives
+in an isolated world, so patching `EventTarget.prototype` there would not
+touch the page's listeners.
 
 Together with the shadow-aware extraction this makes both *manual* copying and
 the extension's own capture work on pages that would otherwise be copy-locked.
@@ -234,31 +240,57 @@ an in-thread "fake worker". `workerSrc` is set as belt-and-braces.
   extension page round-trips for the data itself.
 - The primary download path is a **temporary `<a download>` with a blob URL,
   clicked in the page** — no message-size limits at all. The service worker
-  (`chrome.downloads.download` via blob:, then data:) is the fallback.
+  (`chrome.downloads.download` via a data: URL) is the fallback for the rare
+  case where the page anchor is unavailable.
+- The **Resources tab** is captured separately: its download buttons sign a
+  CloudFront URL and click a hidden `<a download>`. `mainworld.js` intercepts
+  that click, returns the signed URL to the content script, and the bytes are
+  fetched through the service worker into `resources/`. This adds the
+  standalone lab HTML and the resource-service PKA copies that are not in
+  `assets.json`.
 - The content script also watches `chrome.downloads.onCreated` broadcasts so
-  the panel can report which resource triggered which download (the site
-  itself triggers some downloads, e.g. for `.pka` files).
+  a site-triggered blob download can be captured (`*-captured`) and so a
+  resources-tab click still works if the main-world hook is unavailable.
 
 ### 8. What is deliberately out of scope
 
-- **Interactive forms** (survey answers, the exam) are captured *as rendered*
-  on the start pages. The exam questions only exist after you press Start in
-  the player, so they are not included.
+- **Assessments and question banks.** Sections whose title matches
+  exam/quiz/test/assessment/survey are listed in the log and **not clicked**,
+  so a walk cannot consume an attempt or open an exam. The locked final-exam
+  page is not part of the content player.
+- **Brightcove-hosted videos.** The free courses use Brightcove players whose
+  media loads only after Play, behind a deactivated/protected player. The ZIP
+  keeps the video title, poster image, Brightcove `video-id` reference, and the
+  full `components.json` (account/player/video IDs), but not the video binary.
 - **Live streams** without a direct file URL are kept as embed references.
+- `.pka` files are captured; the Packet Tracer application itself is not.
 
 ---
 
 ## Notes & limitations
 
-- **`content.md` is the reliable full-text artifact.** `content.html` captures
+- **`content.md` is the rendered full-text artifact.** `content.html` captures
   the light DOM only (shadow trees don't serialise through the browser's
-  save-as-HTML), so it is a secondary artifact. For reading or re-hosting, use
-  `content.md` and the raw JSON in `modules/*/raw/`.
+  save-as-HTML), so it is a secondary artifact. A few components render a
+  collapsed preview (the visible text ends in `…`); the untruncated authoring
+  HTML for those is in `modules/*/raw/components.json` / `articles.json`.
+  For reading or re-hosting, use `content.md` and the raw JSON.
 - **Server-gated files:** some resources (e.g. certain PDFs) return HTTP 403
   to everyone — including the logged-in app's own UI, which simply doesn't
   list them. The extension records those as metadata stubs in `resources/`
   rather than dropping them; everything else is captured.
+- **Partial runs are labeled.** Any page/asset/media/resource that could not
+  be captured is listed in `FAILURES.txt` at the ZIP root and in
+  `manifest.json` (`failures`), and the final log says `DONE (partial)`. A
+  run with no captured lesson pages does not produce a ZIP.
 - **Videos** are downloaded when the page references a file (`.mp4`/`.m3u8`).
+  The current free courses use Brightcove; those are recorded as their
+  `video-id` and poster in `content.md`, with the full player metadata in
+  `components.json`, but the protected stream itself is not downloaded.
+- **Resources tab:** standalone lab HTML and the resource-service `.pka` copies
+  are fetched through their signed URLs and placed in `resources/`. The module
+  `assets/` directory still contains the asset-service copies; both are kept
+  because they can differ.
 - **Nothing is uploaded anywhere**; the extension only talks to `netacad.com`
   (and the CDNs NetAcad uses for media).
 - **Debug hook:** in the DevTools console of any NetAcad page,
@@ -275,9 +307,10 @@ an in-thread "fake worker". `workerSrc` is set as belt-and-braces.
 
 | File | Purpose |
 |---|---|
-| `manifest.json` | Extension manifest (MV3). |
-| `background.js` | Service worker: pdf.js text extraction, download triggering, asset fetching proxy. |
-| `content.js` | All the page work: copy-unlock, shadow-aware extraction, settle detection, course walk, resource/PDF capture, ZIP packaging. |
+| `manifest.json` | Extension manifest (MV3; requires Chrome/Edge 111+ for `world: "MAIN"`). |
+| `background.js` | Service worker: pdf.js text extraction, download triggering, asset fetching proxy, download-event broadcast. |
+| `mainworld.js` | Page-world shim: copy-guard neutraliser, object-URL tracker, Resources-tab download interceptor. |
+| `content.js` | All the page work: shadow-aware extraction, settle detection, course walk, Resources/PDF capture, ZIP packaging. |
 | `zip/fflate.min.js` | [fflate](https://github.com/feross/fflate) — in-page ZIP compression. |
 | `pdf/pdf.min.js`, `pdf/pdf.worker.min.js` | [pdf.js 3.11.174](https://github.com/mozilla/pdf.js) (last UMD release) — text extraction of PDFs, run as an in-thread fake worker in the service worker. |
 

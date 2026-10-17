@@ -20,7 +20,17 @@ if (pdfjsLib) {
 }
 
 const MAX_ASSET_BYTES = 40 * 1024 * 1024; // base64 stays below the 64 MiB message cap
-const pending = new Map(); // id -> resolve
+const MAX_B64_CHARS = 56e6;
+
+function safeFilename(name) {
+  const base = String(name || "download")
+    .replace(/^.*[\\/]/, "") // never let a caller turn this into a path
+    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "-")
+    .replace(/^\.+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (base || "download").slice(0, 180);
+}
 
 function b64ToU8(b64) {
   const bin = atob(b64);
@@ -36,14 +46,46 @@ function u8ToB64(u8) {
   return btoa(s);
 }
 
+async function readCappedBody(r) {
+  if (!r.body || typeof r.body.getReader !== "function") {
+    const buf = await r.arrayBuffer();
+    if (buf.byteLength > MAX_ASSET_BYTES) return { tooLarge: true, size: buf.byteLength };
+    return { u8: new Uint8Array(buf) };
+  }
+  const reader = r.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_ASSET_BYTES) {
+        try { await reader.cancel(); } catch (e) {}
+        return { tooLarge: true, size: total };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
+  }
+  const u8 = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { u8.set(c, off); off += c.byteLength; }
+  return { u8 };
+}
+
 async function fetchAsset(url) {
   try {
     const r = await fetch(url, { credentials: "include" });
     if (!r.ok) return { ok: false, status: r.status, url, type: "application/octet-stream", size: 0, data: "" };
     const type = (r.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
-    const buf = await r.arrayBuffer();
-    if (buf.byteLength > MAX_ASSET_BYTES) return { ok: false, error: "too large", url, type, size: buf.byteLength };
-    return { ok: true, status: r.status, url, type, size: buf.byteLength, data: u8ToB64(new Uint8Array(buf)) };
+    const declared = parseInt(r.headers.get("content-length") || "0", 10);
+    if (declared > MAX_ASSET_BYTES) return { ok: false, error: "too large", url, type, size: declared };
+    const read = await readCappedBody(r);
+    if (read.tooLarge) return { ok: false, error: "too large", url, type, size: read.size };
+    return { ok: true, status: r.status, url, type, size: read.u8.byteLength, data: u8ToB64(read.u8) };
   } catch (e) {
     return { ok: false, url, type: "application/octet-stream", size: 0, data: "", error: e && e.message || String(e) };
   }
@@ -86,51 +128,64 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
           break;
         }
         case "saveZip": {
-          const opts = { filename: msg.filename, saveAs: false, conflictAction: "uniquify" };
-          let e1 = null;
-          if (msg.blobUrl) {
-            try {
-              const id = await chrome.downloads.download({ ...opts, url: msg.blobUrl });
-              send({ ok: true, id, via: "blob" });
-              break;
-            } catch (e) { e1 = e; }
-          }
           if (typeof msg.b64 !== "string" || !msg.b64 || msg.b64.length >= 48e6) {
-            send({ ok: false, error: "blob: " + (e1 ? e1.message : "no url") + " | data: payload too large or empty" });
+            send({ ok: false, error: "ZIP payload too large or empty" });
             break;
           }
           try {
-            const id = await chrome.downloads.download({ ...opts, url: "data:application/zip;base64," + msg.b64 });
-            send({ ok: true, id, via: "data", note: e1 && e1.message });
+            const id = await chrome.downloads.download({
+              filename: safeFilename(msg.filename || "course.zip"),
+              saveAs: false,
+              conflictAction: "uniquify",
+              url: "data:application/zip;base64," + msg.b64,
+            });
+            send({ ok: true, id, via: "data" });
           } catch (e2) {
-            send({ ok: false, error: "blob: " + (e1 ? e1.message : "no url") + " | data: " + e2.message });
+            send({ ok: false, error: String((e2 && e2.message) || e2) });
           }
           break;
         }
-        case "downloadUrl": {
-          const res = await fetchAsset(msg.url);
-          if (!res.ok) { send(res); break; }
-          const bytes = b64ToU8(res.data);
-          const mime = (res.type || "application/octet-stream").split(";")[0];
-          const opts = { filename: msg.filename, saveAs: false, conflictAction: "uniquify" };
-          if (bytes.byteLength > 1.4 * 1024 * 1024) {
-            if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function" || typeof Blob === "undefined") {
-              send({ ok: false, error: "asset too large for data URL and blob URLs are unavailable" });
-              break;
-            }
-            const blobUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
-            try {
-              const id = await chrome.downloads.download({ ...opts, url: blobUrl });
-              send({ ok: true, id, via: "blob" });
-            } catch (e) {
-              send({ ok: false, error: "asset too large for data URL; blob download failed: " + String((e && e.message) || e) });
-            } finally {
-              setTimeout(() => { try { URL.revokeObjectURL(blobUrl); } catch (e) {} }, 60000);
-            }
+        case "saveAsset": {
+          // Blob downloads created by the page cannot be re-fetched in the
+          // service worker (object URLs are page-origin), so the content
+          // script sends the bytes it already read in the page. A service
+          // worker has no URL.createObjectURL, so use a data: URL here.
+          if (typeof msg.b64 !== "string" || !msg.b64 || msg.b64.length >= MAX_B64_CHARS) {
+            send({ ok: false, error: "asset payload too large or empty" });
             break;
           }
-          const id = await chrome.downloads.download({ ...opts, url: "data:" + mime + ";base64," + res.data });
-          send({ ok: true, id });
+          const mime = String(msg.mime || "application/octet-stream").split(";")[0].trim() || "application/octet-stream";
+          try {
+            const id = await chrome.downloads.download({
+              filename: safeFilename(msg.filename),
+              saveAs: false,
+              conflictAction: "uniquify",
+              url: "data:" + mime + ";base64," + msg.b64,
+            });
+            send({ ok: true, id, via: "data" });
+          } catch (e) {
+            send({ ok: false, error: String((e && e.message) || e) });
+          }
+          break;
+        }
+        case "downloadUrlDirect": {
+          // Fallback for a suppressed resource-tab click when reading the
+          // signed URL through fetch fails: let Chrome download it directly.
+          if (typeof msg.url !== "string" || !/^https:\/\//.test(msg.url)) {
+            send({ ok: false, error: "bad url" });
+            break;
+          }
+          try {
+            const id = await chrome.downloads.download({
+              filename: safeFilename(msg.filename || "resource"),
+              saveAs: false,
+              conflictAction: "uniquify",
+              url: msg.url,
+            });
+            send({ ok: true, id, via: "url" });
+          } catch (e) {
+            send({ ok: false, error: String((e && e.message) || e) });
+          }
           break;
         }
         case "ping": {
@@ -147,7 +202,37 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
   return true; // async response
 });
 
-// Broadcast download-start events (used to detect resource entries that trigger downloads)
+// Broadcast download-start events to NetAcad content frames. runtime.sendMessage
+// does not reach content scripts reliably, so use tabs.sendMessage.
+function broadcastDownloadStarted(item) {
+  const msg = {
+    type: "downloadStarted",
+    url: item.url,
+    filename: item.filename || "",
+    mime: item.mime || "",
+  };
+  const sendTo = (tabs) => {
+    for (const tab of tabs || []) {
+      if (!tab || tab.id == null) continue;
+      chrome.tabs.sendMessage(tab.id, msg).catch(() => {});
+    }
+  };
+  try {
+    chrome.tabs.query({ url: ["https://*.netacad.com/*"] }, (tabs) => {
+      if (chrome.runtime.lastError || !tabs || !tabs.length) {
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }, (fallback) => sendTo(fallback));
+      } else {
+        sendTo(tabs);
+      }
+    });
+  } catch (e) {
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }, (fallback) => sendTo(fallback));
+  }
+}
+
 chrome.downloads.onCreated.addListener((item) => {
-  chrome.runtime.sendMessage({ type: "downloadStarted", url: item.url, filename: item.filename }).catch(() => {});
+  // Ignore files this extension itself saves; otherwise a captured download
+  // could feed back into another capture.
+  if (item.byExtensionId) return;
+  broadcastDownloadStarted(item);
 });
