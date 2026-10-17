@@ -783,19 +783,19 @@
     if (r && r.ok && typeof r.data === "string") {
       return { ok: true, status: r.status || 200, type: r.type || "", size: r.size || 0, b64: r.data };
     }
-    if (r && (r.error === "too large" || r.error === "timeout")) {
-      return { ok: false, status: r.status || "error", error: r.error, size: r.size || 0 };
-    }
+    // A worker payload is capped by Chrome's message size (~64 MiB), but the
+    // page itself can read a larger same-origin asset and keep the bytes in
+    // memory for the ZIP. This is what makes >40 MiB .pksz assets work.
     try {
       const fr = await fetch(url, { credentials: "include" });
       if (!fr.ok) return { ok: false, status: fr.status, type: fr.headers.get("content-type") || "" };
       const len = parseInt(fr.headers.get("content-length") || "0", 10);
-      if (len > MAX_PDF_BYTES) return { ok: false, status: 200, error: "too large" };
+      if (len > MAX_DIRECT_BYTES) return { ok: false, status: 200, error: "too large" };
       const buf = await fr.arrayBuffer();
-      if (buf.byteLength > MAX_PDF_BYTES) return { ok: false, status: 200, error: "too large" };
+      if (buf.byteLength > MAX_DIRECT_BYTES) return { ok: false, status: 200, error: "too large" };
       return { ok: true, status: 200, type: fr.headers.get("content-type") || "", size: buf.byteLength, b64: u8ToB64(new Uint8Array(buf)) };
     } catch (e) {
-      return { ok: false, status: "error", error: String((e && e.message) || e) };
+      return { ok: false, status: r && (r.status || r.error) || "error", error: String((e && e.message) || e) };
     }
   }
 
@@ -806,6 +806,7 @@
   // Worker constructor and no document), so we ship bytes over the message
   // channel and come back with text.
   const MAX_PDF_BYTES = 40 * 1024 * 1024;
+  const MAX_DIRECT_BYTES = 200 * 1024 * 1024;
 
   function isPdfUrl(url) {
     return /\.pdf(\?|#|$)/i.test(url);
@@ -865,7 +866,9 @@
     const mdPath = dir + "/" + name + ".md";
 
     if (res.ok && res.b64 && isPdf) {
-      const ex = await extractPdfViaSW(res.b64);
+      const ex = res.b64.length < 56e6
+        ? await extractPdfViaSW(res.b64)
+        : { ok: false, error: "PDF too large to send to pdf.js; raw file kept" };
       if (ex && ex.ok && !ex.empty) {
         if (!entries.some((e) => e.path === mdPath)) {
           entries.push({
@@ -1528,7 +1531,10 @@
       const courseDir = sanitizeName(courseTitle(), 80);
       const entries = [];
       const failures = [];
+      const moduleRecords = new Map(); // key -> { order, id, title, folder, pages: [] }
+      const pageRecords = [];
       const capturedDirs = new Set();
+      const capturedHashes = new Map(); // content hash -> { dir, label, expected }
       const viewedPdfSeen = new Set(); // dedupe viewed-PDF captures across the walk
       const resourceByUrl = new Map(); // URL -> path in the ZIP
       const resourceByKey = new Set(); // title + leaf, same resource in two modules
@@ -1684,7 +1690,8 @@
       };
 
       // save whatever is currently displayed in the player
-      const saveCurrent = async (moduleLabel, pageTitle, key, moduleNumber, expectedLabel) => {
+      const saveCurrent = async (moduleLabel, pageTitle, key, moduleNumber, expectedLabel, meta) => {
+        meta = meta || {};
         const c = await getActiveContent();
         let titleOk = true;
         if (expectedLabel) {
@@ -1696,6 +1703,34 @@
         const label = (!expectedLabel || titleOk)
           ? ((c.pageTitle && c.pageTitle !== c.title ? c.pageTitle : expandTemplate(pageTitle || c.title, { moduleNumber: moduleNumber || baseRoute.moduleNumber })) || c.title || "page")
           : expectedLabel;
+        // Use the page text, not the light-DOM HTML: overview aliases carry a
+        // different page header but the same lesson body.
+        const contentKey = hashStr(c.md);
+        const previous = capturedHashes.get(contentKey);
+        if (previous) {
+          if (expectedLabel && !previous.expected) {
+            // The module mount/overview and the real contentObjects page can
+            // have identical text. Prefer the page with an authored title.
+            for (let i = entries.length - 1; i >= 0; i--) {
+              if (String(entries[i].path || "").startsWith(previous.dir + "/")) entries.splice(i, 1);
+            }
+            const pi = capturedPages.lastIndexOf(previous.label);
+            if (pi >= 0) capturedPages.splice(pi, 1);
+            if (previous.record) {
+              const pi2 = pageRecords.indexOf(previous.record);
+              if (pi2 >= 0) pageRecords.splice(pi2, 1);
+              const mr = moduleRecords.get(previous.moduleKey);
+              if (mr) {
+                const pi3 = mr.pages.indexOf(previous.record);
+                if (pi3 >= 0) mr.pages.splice(pi3, 1);
+              }
+            }
+            log("replacing duplicate overview \"" + previous.label + "\" with \"" + label + "\"");
+          } else {
+            log("duplicate page content (" + label + "); skipped");
+            return c;
+          }
+        }
         const dir = courseDir + "/lessons/" + lessonDirFor(moduleLabel, label, key || label);
         if (!capturedDirs.has(dir)) {
           capturedDirs.add(dir);
@@ -1719,6 +1754,35 @@
           entries.push({ path: dir + "/content.html", text: "<!doctype html><meta charset=utf-8><title>" + escapeHtml(label) + "</title>" + c.html });
           await captureViewedPdfs(entries, dir, viewedPdfSeen, failures);
         }
+        const relDir = dir.slice(courseDir.length + 1);
+        const moduleKey = meta.moduleId || moduleLabel;
+        const moduleFolder = relDir.split("/").slice(0, 2).join("/");
+        const record = {
+          order: pageRecords.length,
+          id: meta.pageId || key || null,
+          title: label,
+          folder: relDir,
+          markdown: relDir + "/content.md",
+          html: relDir + "/content.html",
+          media: entries.filter((e) => String(e.path || "").startsWith(dir + "/media/"))
+            .map((e) => String(e.path).slice(courseDir.length + 1)),
+          pdfs: entries.filter((e) => String(e.path || "").startsWith(dir + "/pdf/"))
+            .map((e) => String(e.path).slice(courseDir.length + 1)),
+        };
+        let mrec = moduleRecords.get(moduleKey);
+        if (!mrec) {
+          mrec = {
+            order: meta.moduleOrder == null ? moduleRecords.size : meta.moduleOrder,
+            id: meta.moduleId || null,
+            title: moduleLabel,
+            folder: moduleFolder,
+            pages: [],
+          };
+          moduleRecords.set(moduleKey, mrec);
+        }
+        mrec.pages.push(record);
+        pageRecords.push(record);
+        capturedHashes.set(contentKey, { dir, label, expected: !!expectedLabel, record, moduleKey });
         capturedPages.push(label);
         return c;
       };
@@ -1844,7 +1908,8 @@
       const visitedModules = new Set();
       let idx = 0;
       let noCourseLogged = false;
-      for (const g of groups) {
+      for (let gi = 0; gi < groups.length; gi++) {
+        const g = groups[gi];
         for (const sub of g.subs) {
           idx++;
           try {
@@ -1858,6 +1923,10 @@
             }
             if (ASSESS_RE.test(sub.title + " " + g.module)) {
               log(idx + "/" + total + " " + sub.title + " (assessment/exam skipped)");
+              continue;
+            }
+            if (/\bchapter\s+\d+\s+overview\b/i.test(sub.title)) {
+              log(idx + "/" + total + " " + sub.title + " (overview alias skipped)");
               continue;
             }
             if (moduleId) {
@@ -1908,7 +1977,7 @@
                       failures.push("page: " + pageLabel + " (navigation timeout)");
                       continue;
                     }
-                    const c = await saveCurrent(g.module, pageLabel, pg.id, modNum, pageLabel);
+                    const c = await saveCurrent(g.module, pageLabel, pg.id, modNum, pageLabel, { moduleId, moduleOrder: gi, pageId: pg.id });
                     if (!c) {
                       failures.push("page: " + pageLabel + " (identity mismatch)");
                       continue;
@@ -1918,7 +1987,7 @@
                 } else {
                   const mounted = await waitForPage(beforeMount, null, 20000);
                   if (!mounted) log(idx + "/" + total + " " + sub.title + " (no page list; captured the mounted view)");
-                  await saveCurrent(g.module, sub.title, "module:" + moduleId, modNum);
+                  await saveCurrent(g.module, sub.title, "module:" + moduleId, modNum, null, { moduleId, moduleOrder: gi });
                   log(idx + "/" + total + " " + sub.title);
                 }
                 await fetchModuleAssets(moduleId);
@@ -1929,7 +1998,7 @@
                   noCourseLogged = true;
                 }
                 await waitForPage(beforeMount, null, 20000);
-                await saveCurrent(g.module, sub.title, "module:" + moduleId, modNum);
+                await saveCurrent(g.module, sub.title, "module:" + moduleId, modNum, null, { moduleId, moduleOrder: gi });
                 log(idx + "/" + total + " " + sub.title);
               }
               visitedModules.add(moduleId);
@@ -1939,7 +2008,7 @@
               if (clickBtn) clickBtn.click();
               const changed = await waitForPage(beforeSig, null, 20000);
               if (!changed) log(idx + "/" + total + " " + sub.title + " (section did not change; capturing current view)");
-              await saveCurrent(g.module, sub.title, "native:" + idx, baseRoute.moduleNumber);
+              await saveCurrent(g.module, sub.title, "native:" + idx, baseRoute.moduleNumber, null, { moduleOrder: gi });
               log(idx + "/" + total + " " + sub.title);
             }
           } catch (e) {
@@ -1955,6 +2024,33 @@
       log("Capturing Resources tab...");
       await captureResourceTab();
 
+      // Ordered, machine-readable index for downstream PDF/EPUB tooling.
+      const orderedModules = [...moduleRecords.values()]
+        .sort((a, b) => a.order - b.order)
+        .map((m) => ({ ...m, pages: m.pages.slice().sort((a, b) => a.order - b.order) }));
+      const resourceRecords = entries
+        .filter((e) => String(e.path || "").startsWith(courseDir + "/resources/"))
+        .map((e) => ({ title: e.path.split("/").pop(), path: e.path.slice(courseDir.length + 1) }));
+      const mdText = new Map(entries.filter((e) => e.text).map((e) => [e.path, e.text]));
+      let courseMd = "---\ntitle: " + JSON.stringify(courseTitle()) + "\n" +
+        "source: " + JSON.stringify(location.href) + "\n" +
+        "date: " + new Date().toISOString() + "\n---\n\n# " + courseTitle() + "\n\n";
+      for (const m of orderedModules) {
+        courseMd += "## " + m.title + "\n\n";
+        for (const p of m.pages) {
+          let body = mdText.get(courseDir + "/" + p.markdown) || "";
+          body = body.replace(/^#\s+[^\n]*\n+/, "");
+          body = body.replace(/(!?\[[^\]]*\]\()(media\/|pdf\/)/g, "$1" + p.folder + "/$2");
+          courseMd += "### " + p.title + "\n\n" + body.trim() + "\n\n";
+        }
+      }
+      if (resourceRecords.length) {
+        courseMd += "## Course resources\n\n";
+        for (const r of resourceRecords) courseMd += "- [" + r.title + "](" + r.path + ")\n";
+        courseMd += "\n";
+      }
+      entries.push({ path: courseDir + "/course.md", text: courseMd });
+
       // README + manifest
       const readme =
         "# " + courseTitle() + "\n\n" +
@@ -1962,7 +2058,9 @@
         "Extracted: " + new Date().toISOString() + "\n" +
         "Pages: " + capturedPages.length + "\n\n" +
         "Layout:\n" +
-        "- lessons/<module>/<page>/content.md | content.html | media/*\n" +
+        "- course.md (ordered printable Markdown, local media links)\n" +
+        "- manifest.json (schema, ordered modules/pages, paths, resources)\n" +
+        "- lessons/<module>/<page>/content.md | content.html | media/* | pdf/*\n" +
         "- modules/<id>/raw/*.json (course data) | modules/<id>/assets/* (all lab/doc assets incl. .pka)\n" +
         "- resources/* (course resource documents)\n";
       if (failures.length) {
@@ -1970,8 +2068,13 @@
       }
       entries.push({ path: courseDir + "/README.md", text: readme });
       entries.push({ path: courseDir + "/manifest.json", text: JSON.stringify({
+        schema: "netacad-grabber/2",
         course: courseDir, source: location.href, date: new Date().toISOString(),
-        pages: capturedPages, failures,
+        courseMarkdown: "course.md",
+        pages: capturedPages,
+        modules: orderedModules,
+        resources: resourceRecords,
+        failures,
       }, null, 2) });
 
       log("Packaging " + entries.length + " files...");

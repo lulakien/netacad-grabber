@@ -267,6 +267,39 @@ an in-thread "fake worker". `workerSrc` is set as belt-and-braces.
 
 ---
 
+## Output contract (for downstream agents)
+
+The ZIP is ordered, not alphabetical:
+
+- `course.md` is the printable whole-course Markdown. It has a YAML title/source
+  header, one `##` per module and one `###` per page in course order. Image and
+  PDF links are rewritten to ZIP-root-relative paths.
+- `manifest.json` (`schema: "netacad-grabber/2"`) is the machine-readable index.
+  `modules[]` and `modules[].pages[]` carry explicit `order` integers, the
+  original page/module IDs where available, the sanitised folder names, and
+  `markdown` / `html` / `media` / `pdfs` paths.
+- Use `manifest` paths rather than sorting folders: names are sanitised, length-
+  capped and may have collision suffixes.
+- `lessons/<module>/<page>/content.md` is the per-lesson source;
+  `modules/<id>/raw/` is the authoritative authoring JSON; `resources/` holds
+  course-level files and extracted PDF text; `FAILURES.txt` lists anything the
+  server refused.
+
+A full-course PDF can be produced without guessing order:
+
+```bash
+unzip Course.zip -d course
+pandoc "course/<Course Title>/course.md" \
+  -o course.pdf \
+  --resource-path="course/<Course Title>" \
+  --pdf-engine=weasyprint
+```
+
+For a module-only PDF, concatenate the `markdown` paths of one
+`manifest.modules[]` entry in `pages[].order`; for a single lesson, render that
+page's `content.md` directly. `content.html` is only a light-DOM snapshot and
+is not the print source.
+
 ## Notes & limitations
 
 - **`content.md` is the rendered full-text artifact.** `content.html` captures
