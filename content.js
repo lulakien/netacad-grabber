@@ -1840,6 +1840,7 @@
         }
         return null;
       };
+      const ASSESS_RE = /\b(exam|quiz|assessment|test|survey|knowledge check)\b/i;
       const visitedModules = new Set();
       let idx = 0;
       let noCourseLogged = false;
@@ -1853,6 +1854,10 @@
             const moduleId = ac && /^submodule-/.test(ac) ? ac.replace(/^submodule-/, "") : null;
             if (moduleId && visitedModules.has(moduleId)) {
               log(idx + "/" + total + " " + sub.title + " (already captured)");
+              continue;
+            }
+            if (ASSESS_RE.test(sub.title + " " + g.module)) {
+              log(idx + "/" + total + " " + sub.title + " (assessment/exam skipped)");
               continue;
             }
             if (moduleId) {
@@ -1888,6 +1893,10 @@
                 if (pages.length) {
                   for (const pg of pages) {
                     const pageLabel = expandTemplate(pg.title, { moduleNumber: modNum }) || pg.id;
+                    if (ASSESS_RE.test(pageLabel)) {
+                      log(idx + "/" + total + " " + pageLabel + " (assessment/exam skipped)");
+                      continue;
+                    }
                     const alreadyThere = iframeHasPageId(pg.id);
                     const beforeSig = readSig();
                     if (!gotoPage(moduleId, pg.id, modNum)) {
@@ -1925,14 +1934,7 @@
               }
               visitedModules.add(moduleId);
             } else {
-              // Native sections are surveys/exams/assessment launch pages. Do
-              // not click them: opening an exam can consume an attempt and the
-              // questions are explicitly out of scope. Other native sections
-              // still get captured from their current view.
-              if (/\b(exam|quiz|assessment|test|survey)\b/i.test(sub.title + " " + g.module)) {
-                log(idx + "/" + total + " " + sub.title + " (assessment/exam skipped)");
-                continue;
-              }
+              // Assessment/survey titles were already skipped above.
               const beforeSig = readSig();
               if (clickBtn) clickBtn.click();
               const changed = await waitForPage(beforeSig, null, 20000);
